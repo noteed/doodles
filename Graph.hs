@@ -178,12 +178,12 @@ lift2 f name = \a b -> do
   n <- gets nextName
   addChild n n1
   addChild n n2
-  addNode n (Op (typeOf $ f undefined) name [n1,n2] [] (max rk1 rk2 + 1))
+  addNode n (Op (typeOf $ f undefined undefined) name [n1,n2] [] (max rk1 rk2 + 1))
   return (TRef n)
 
 foo = lift2 f "foo"
-  where f :: Int -> Float -> Float
-        f x s = 1.0
+  where f :: Int -> Float -> String
+        f x s = "hello"
 
 milliseconds = baseInt "milliseconds"
 
