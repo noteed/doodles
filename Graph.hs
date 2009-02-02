@@ -35,13 +35,16 @@ false = False
 int = typeOf (undefined :: Int)
 float = typeOf (undefined :: Float)
 
-myTypeOf t = go (typeOf t) []
-  where
-    go t acc =
-      if null xs
-        then (reverse acc,t)
-        else go (last xs) (head xs : acc)
-      where xs = typeRepArgs t
+-- Thanks to Ross Mellgren on the Haskell-Cafe mailing list.
+argsOf :: TypeRep -> [TypeRep]
+argsOf ty
+  | typeRepTyCon ty == funTyCon = let ([x,y]) = typeRepArgs ty in x : argsOf y
+  | otherwise = [ty] -- 'return' type
+  where funTyCon :: TyCon
+        funTyCon = mkTyCon "->"
+
+myTypeOf :: Typeable a => a -> [TypeRep]
+myTypeOf = argsOf . typeOf
 
 -- A reference is simply an Int. But to gain some type-safety
 -- the reference are wrapped (below).
@@ -55,10 +58,11 @@ type RFloat = TRef Float
 
 type Rank = Int
 
--- e.g. Op Int "plus" [a,b] [c] means the node Plus depends on a and b (the parents)
--- and c depends on it (c is a child of Plus).
+-- e.g. Op ([Int,Int],Int) "plus" [a,b] [c] means the node Plus depends
+-- on a and b (the parents) and c depends on it (c is a child of Plus).
+-- Furthermore the type of the parents should match with the one of the Op.
 data Node = Base TypeRep String [Ref]
-          | Op TypeRep String  [Ref] [Ref] Rank -- parents, children
+          | Op [TypeRep] String  [Ref] [Ref] Rank -- parents, children
   deriving Show
 
 info (Base _ i _) = i
@@ -159,7 +163,7 @@ lift1 f name = \a -> do
   rk <- gets (rank . (IM.! n1) . nodes)
   n <- gets nextName
   addChild n n1
-  addNode n (Op (typeOf $ f undefined) name [n1] [] (rk + 1))
+  addNode n (Op (myTypeOf f) name [n1] [] (rk + 1))
   return (TRef n)
 
 lift2 :: (Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
@@ -171,12 +175,12 @@ lift2 f name = \a b -> do
   n <- gets nextName
   addChild n n1
   addChild n n2
-  addNode n (Op (typeOf $ f undefined undefined) name [n1,n2] [] (max rk1 rk2 + 1))
+  addNode n (Op (myTypeOf f) name [n1,n2] [] (max rk1 rk2 + 1))
   return (TRef n)
 
 foo = lift2 f "foo"
-  where f :: Int -> Float -> String
-        f x s = "hello"
+f :: Int -> Float -> String
+f x s = "hello"
 
 milliseconds = baseInt "milliseconds"
 
