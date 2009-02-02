@@ -90,7 +90,7 @@ byrank g = sortBy (\a b -> (rank . snd) a `compare` (rank . snd) b) (alist g)
 
 grouped g = groupBy (\a b -> (rank . snd) a == (rank . snd) b) (byrank g)
 
--- lables
+-- labels
 dotOne1 (r,node) = "n" ++ show r ++ " [label=\"" ++ info node ++ "\"]\n"
 dotRank1 = concatMap dotOne1
 dot1 = (concatMap dotRank1) . grouped
@@ -111,26 +111,19 @@ instance Show (N w) where
   show g = show $ execState g emptyGraph
 
 instance Eq (N w) where
-  a == b = error "TODO: Eq instance for WrapRef."
+  a == b = error "TODO: Eq instance for (N w)"
 
-instance Num (N Int) where
+instance (Typeable n, Num n) => Num (N n) where
   (+) = lift2 (+) "add"
   (*) = lift2 (*) "mul"
   signum = lift1 signum "signumf"
   abs = lift1 abs "abs"
-  fromInteger = baseInt . show
+  fromInteger = (base undefined) . show
 
-instance Num (N Float) where
-  (+) = lift2 (+) "add"
-  (*) = lift2 (*) "mul"
-  signum = lift1 signum "signum"
-  abs = lift1 abs "absf"
-  fromInteger =  baseFloat . show . fromInteger
-
-instance Fractional (N Float) where
+instance (Typeable n, Fractional n) => Fractional (N n) where
   (/) = lift2 (/) "divf"
   recip = lift1 recip "recip"
-  fromRational = baseFloat . show . fromRational
+  fromRational = (base undefined) . show . fromRational
 
 addChild' c (Base t info cs) = Base t info (c:cs)
 addChild' c (Op t info ps cs rk) = Op t info ps (c:cs) rk
