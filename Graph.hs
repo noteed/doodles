@@ -15,11 +15,12 @@
 -- But nothing enforces the relationship between the type
 -- of the typed references and the value denoting that type
 -- inside the Node. See for instance how the Float type
--- appearing in the type signature of baseInt is related
+-- appearing in the type signature of (constant float) is related
 -- to the Float value (of type TypeRep) in the constructed
 -- node. Maybe I could use TH to generate some of this stuff.
 --
 -- 'usage' : in ghci : doDot ex1
+-- or : ghc Graph.hs -e 'doDot ex1' | dot -Tsvg -oex1.svg
 --
 module Graph where
 
@@ -32,8 +33,8 @@ import Data.Dynamic
 true = True
 false = False
 
-int = typeOf (undefined :: Int)
-float = typeOf (undefined :: Float)
+int = undefined :: Int
+float = undefined :: Float
 
 -- Thanks to Ross Mellgren on the Haskell-Cafe mailing list.
 argsOf :: TypeRep -> [TypeRep]
@@ -52,6 +53,7 @@ type Ref = Int
 
 -- A typed reference.
 data TRef a = TRef Ref
+  deriving Show
 
 type RInt = TRef Int
 type RFloat = TRef Float
@@ -61,22 +63,46 @@ type Rank = Int
 -- e.g. Op ([Int,Int],Int) "plus" [a,b] [c] means the node Plus depends
 -- on a and b (the parents) and c depends on it (c is a child of Plus).
 -- Furthermore the type of the parents should match with the one of the Op.
-data Node = Base TypeRep String [Ref]
-          | Op [TypeRep] String  [Ref] [Ref] Rank -- parents, children
+data Node = Cst TypeRep  String [Ref]
+          | In  TypeRep  String [Ref]               -- children
+          | Out TypeRep  String [Ref] Rank         -- parents
+          | Op [TypeRep] String [Ref] [Ref] Rank -- parents, children
   deriving Show
 
-info (Base _ i _) = i
+isCst (Cst _ _ _) = True
+isCst _ = False
+isIn (In _ _ _) = True
+isIn _ = False
+isOut (Out _ _ _ _) = True
+isOut _ = False
+isOp (Op _ _ _ _ _) = True
+isOp _ = False
+
+info (Cst _ i _) = i
+info (In _ i _) = i
+info (Out _ i _ _) = i
 info (Op _ i _ _ _) = i
 
 rank :: Node -> Rank
-rank (Base _ _ _) = 0
+rank (Cst _ _ _) = 0
+rank (In _ _ _) = 0
+rank (Out _ _ _ rk) = rk
 rank (Op _ _ _ _ rk) = rk
 
-parents (Base _ _ _) = []
+parents (Cst _ _ _) = []
+parents (In _ _ _) = []
+parents (Out _ _ p _) = []
 parents (Op _ _ _ p _) = p
 
-children (Base _ _ c) = c
+children (Cst _ _ c) = c
+children (In _ _ c) = c
+children (Out _ _ _ _) = []
 children (Op _ _ _ c _) = c
+
+typeRep (Cst t _ _) = t
+typeRep (In t _ _) = t
+typeRep (Out t _ _ _) = t
+typeRep (Op t _ _ _ _) = last t
 
 data G = G { nodes :: IM.IntMap Node, nextName :: Ref }
   deriving Show
@@ -90,12 +116,26 @@ graph = nodes . (flip execState emptyGraph)
 
 alist = IM.toList . graph
 
+-- Returns all the nodes sorted by their rank (so Inputs and Constans come first).
 byrank g = sortBy (\a b -> (rank . snd) a `compare` (rank . snd) b) (alist g)
 
+-- Groups all the nodes according to their rank (with Inputs and
+-- Constants coming first).
 grouped g = groupBy (\a b -> (rank . snd) a == (rank . snd) b) (byrank g)
 
--- labels
-dotOne1 (r,node) = "n" ++ show r ++ " [label=\"" ++ info node ++ "\"]\n"
+-- Gives the list of node which depends on the node (referenced by n).
+below g n = tail $ below' n
+  where below' n = let n' = l n in (n,n') : concatMap below' (children n')
+        l n = (graph g) IM.! n
+
+-- nodes
+dotOne1 (r,node) = "n" ++ show r ++ " [" ++
+  (concat $ intersperse ", " $ ["label=\"" ++ info node ++ "\""] ++ attr node)
+  ++ "]\n"
+  where attr n | isCst n = ["color=grey"]
+               | isIn n = ["color=cyan"]
+               | isOut n = ["color=orange"]
+               | otherwise = []
 dotRank1 = concatMap dotOne1
 dot1 = (concatMap dotRank1) . grouped
 
@@ -115,21 +155,46 @@ instance Show (N w) where
   show g = show $ execState g emptyGraph
 
 instance Eq (N w) where
-  a == b = error "TODO: Eq instance for (N w)"
+-- TODO special case for commutative operations.
+  a == b = same g1 g2 (n1,n2)
+   where
+    (TRef n1, nodes -> g1) = runState a emptyGraph
+    (TRef n2, nodes -> g2) = runState b emptyGraph
+
+eq a b = same g1 g2 (n1,n2)
+   where
+    (TRef n1, nodes -> g1) = runState a emptyGraph
+    (TRef n2, nodes -> g2) = runState b emptyGraph
+
+same g1 g2 (n1,n2) =
+  case (g1 IM.! n1) of
+    Cst t1 i1 _     -> case (g2 IM.! n2) of
+                         Cst t2 i2 _ -> t1 == t2 && i1 == i2
+                         otherwise   -> False
+    In t1 i1 _      -> case (g2 IM.! n2) of
+                         In t2 i2 _ -> t1 == t2 && i1 == i2
+                         otherwise   -> False
+    Out t1 i1 p1 _  -> case (g2 IM.! n2) of
+                         Out t2 i2 p2 _ -> t1 == t2 && i1 == i2 && length p1 == length p2 && and (map (same g1 g2) (zip p1 p2))
+                         otherwise   -> False
+    Op t1 i1 p1 _ _ -> case (g2 IM.! n2) of
+                         Op t2 i2 p2 _ _ -> t1 == t2 && i1 == i2 && length p1 == length p2 && and (map (same g1 g2) (zip p1 p2))
+                         otherwise       -> False
 
 instance (Typeable n, Num n) => Num (N n) where
-  (+) = lift2 (+) "add"
-  (*) = lift2 (*) "mul"
+  (+) = lift2 (+) "+"
+  (*) = lift2 (*) "*"
   signum = lift1 signum "signumf"
   abs = lift1 abs "abs"
-  fromInteger = (base undefined) . show
+  fromInteger = (constant undefined) . show
 
 instance (Typeable n, Fractional n) => Fractional (N n) where
-  (/) = lift2 (/) "divf"
+  (/) = lift2 (/) "/"
   recip = lift1 recip "recip"
-  fromRational = (base undefined) . show . fromRational
+  fromRational = (constant undefined) . show . fromRational
 
-addChild' c (Base t info cs) = Base t info (c:cs)
+addChild' c (Cst t info cs) = Cst t info (c:cs)
+addChild' c (In t info cs) = In t info (c:cs)
 addChild' c (Op t info ps cs rk) = Op t info ps (c:cs) rk
 
 -- Create a node (and give it automatically a name).
@@ -150,12 +215,19 @@ addChild c n = do
   g <- get
   put $ g { nodes = IM.adjust (addChild' c) n ns }
 
-base :: Typeable a => a -> String -> N a
-base v info = mkNode (Base (typeOf v) info []) >>= return . TRef
+constant :: Typeable a => a -> String -> N a
+constant v info = mkNode (Cst (typeOf v) info []) >>= return . TRef
 
-baseInt = base (undefined::Int)
+input :: Typeable a => a -> String -> N a
+input v info = mkNode (In (typeOf v) info []) >>= return . TRef
 
-baseFloat = base (undefined::Float)
+out info a = do
+  TRef n1 <- a
+  node <- gets ((IM.! n1) . nodes)
+  n <- gets nextName
+  addChild n n1
+  addNode n (Out (typeRep node) info [n1] (rank node + 1))
+  return (TRef n)
 
 lift1 :: (Typeable a, Typeable b) => (a -> b) -> String -> (N a -> N b)
 lift1 f name = \a -> do
@@ -166,6 +238,29 @@ lift1 f name = \a -> do
   addNode n (Op (myTypeOf f) name [n1] [] (rk + 1))
   return (TRef n)
 
+-- test for similar subgraph (not every nodes are checked, just the two
+-- added nodes are tested against each other, but it works).
+lift2' :: (Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
+lift2' f name = \a b ->
+  if a `eq` b
+   then do
+    TRef n1 <- a
+    rk1 <- gets (rank . (IM.! n1) . nodes)
+    n <- gets nextName
+    addChild n n1
+    addNode n (Op (myTypeOf f) name [n1,n1] [] (rk1 + 1))
+    return (TRef n)
+   else do
+    TRef n1 <- a
+    TRef n2 <- b
+    rk1 <- gets (rank . (IM.! n1) . nodes)
+    rk2 <- gets (rank . (IM.! n2) . nodes)
+    n <- gets nextName
+    addChild n n1
+    addChild n n2
+    addNode n (Op (myTypeOf f) name [n1,n2] [] (max rk1 rk2 + 1))
+    return (TRef n)
+-- no test
 lift2 :: (Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
 lift2 f name = \a b -> do
   TRef n1 <- a
@@ -182,10 +277,27 @@ foo = lift2 f "foo"
 f :: Int -> Float -> String
 f x s = "hello"
 
-milliseconds = baseInt "milliseconds"
+milliseconds = input int "milliseconds"
 
-ex1 = (milliseconds + 45) `foo` 55.6
+ex1 = out "hey" $ (milliseconds + 45) `foo` (55.6 * 1.2)
 
 ex1' = execState ex1 emptyGraph
 
+-- The main problem of this approch is showed
+-- by doDot ex2 : the subgraph constructed by a
+-- is not shared. (It's just like a is a little
+-- program that is run twice by the + combinator.)
+-- If it was a real little language, a would be a
+-- lookup on a symbol table, not two 'commands'.
+--
+-- A solution is to add a node to the graph if
+-- there isn't yet such a node. I.e. every new node
+-- is checked against every existing node. Maybe it
+-- would be expensive but it could find redondant
+-- node even if they were not initially shared.
+ex2 = out "yah" $ a + a
+  where a = (milliseconds + 12 + 46)
+(+++) = lift2' (+) "+check"
+ex3 = out "yah-again" $ a +++ a
+  where a = (milliseconds + 12 + 46)
 
