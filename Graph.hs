@@ -51,6 +51,23 @@ argsOf ty
 myTypeOf :: Typeable a => a -> [TypeRep]
 myTypeOf = argsOf . typeOf
 
+instance Storable String where
+  -- sizeOf :: a -> Int
+  -- alignment :: a -> Int
+  -- peekElemOff :: Ptr a -> Int -> IO a
+  -- pokeElemOff :: Ptr a -> Int -> a -> IO ()
+  -- peekByteOff :: Ptr b -> Int -> IO a
+  -- pokeByteOff :: Ptr b -> Int -> a -> IO ()
+  -- peek :: Ptr a -> IO a
+  -- poke :: Ptr a -> a -> IO ()
+  sizeOf = error "TODO : Storable String instance."
+  alignment = error "TODO : Storable String instance."
+  peekElemOff = error "TODO : Storable String instance."
+  pokeElemOff = error "TODO : Storable String instance."
+  peekByteOff = error "TODO : Storable String instance."
+  pokeByteOff = error "TODO : Storable String instance."
+  poke = error "TODO : Storable String instance."
+
 ----------------------------------------------------------------------
 -- Node
 ----------------------------------------------------------------------
@@ -71,10 +88,10 @@ type Rank = Int
 -- e.g. Op ([Int,Int],Int) "plus" [a,b] [c] means the node Plus depends
 -- on a and b (the parents) and c depends on it (c is a child of Plus).
 -- Furthermore the type of the parents should match with the one of the Op.
-data Node = Cst TypeRep  String [Ref]
-          | In  TypeRep  String [Ref]               -- children
-          | Out TypeRep  String [Ref] Rank         -- parents
-          | Op [TypeRep] String [Ref] [Ref] Rank -- parents, children
+data Node = Cst Type  String [Ref]
+          | In  Type  String [Ref]               -- children
+          | Out Type  String [Ref] Rank         -- parents
+          | Op ([TypeRep], Type) String [Ref] [Ref] Rank -- parents, children
   deriving Show
 
 isCst (Cst _ _ _) = True
@@ -110,7 +127,7 @@ children (Op _ _ _ c _) = c
 typeRep (Cst t _ _) = t
 typeRep (In t _ _) = t
 typeRep (Out t _ _ _) = t
-typeRep (Op t _ _ _ _) = last t
+typeRep (Op (_,t) _ _ _ _) = t
 
 ----------------------------------------------------------------------
 -- Graph
@@ -175,7 +192,7 @@ doDot g = do
 
 vars g = map var (byrank g)
 var (r,node) = (cshow . typeRep) node ++ " " ++ cname (r,node) ++ ";" ++ " /* " ++ info node ++ " */"
-cshow t | t == typeOf int = "int"
+cshow t | t == Type int = "int"
 cname (r,(Cst _ _ _)) = "cst" ++ show r
 cname (r,(In _ _ _)) = "inp" ++ show r
 cname (r,(Op _ _ _ _ _)) = "nod" ++ show r
@@ -199,7 +216,7 @@ upNode g (r,node) | isOut node = "" -- no data to update for an output node
                   | isCst node = "" -- no update for a constant node
                   | isOp  node = upOp g (r,node)
 upOp g (r,node@(Op ts info ps cs rk)) = upOp' g (r,node)
-upOp' g (r,node@(Op ts "+" [a,b] _ _)) | ts == [typeOf int, typeOf int, typeOf int] =
+upOp' g (r,node@(Op (ts,_) "+" [a,b] _ _)) | ts == [typeOf int, typeOf int, typeOf int] =
   cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " + " ++ cname (b,g IM.! b) ++ ";"
 
 outs g = concatMap outOne funs
@@ -220,13 +237,16 @@ doCode g = do
 -- Storable
 ----------------------------------------------------------------------
 
-data Wrap = forall a . (Storable a, Typeable a) => Wrap a
+data Type = forall a . (Storable a, Typeable a) => Type a
 
-instance Show Wrap where
-  show (Wrap a) = show (typeOf a)
+instance Show Type where
+  show (Type a) = show (typeOf a)
 
-mySizeOf (Wrap a) = sizeOf a
-myAlignment (Wrap a) = alignment a
+instance Eq Type where
+  (Type a) == (Type b)= (typeOf a) == (typeOf b)
+
+mySizeOf (Type a) = sizeOf a
+myAlignment (Type a) = alignment a
 
 memory [] = (0,[])
 memory xs = (size,mem)
@@ -273,14 +293,14 @@ same g1 g2 (n1,n2) =
                          Op t2 i2 p2 _ _ -> t1 == t2 && i1 == i2 && length p1 == length p2 && and (map (same g1 g2) (zip p1 p2))
                          otherwise       -> False
 
-instance (Typeable n, Num n) => Num (N n) where
+instance (Storable n, Typeable n, Num n) => Num (N n) where
   (+) = lift2 (+) "+"
   (*) = lift2 (*) "*"
   signum = lift1 signum "signumf"
   abs = lift1 abs "abs"
   fromInteger = (constant undefined) . show
 
-instance (Typeable n, Fractional n) => Fractional (N n) where
+instance (Storable n, Typeable n, Fractional n) => Fractional (N n) where
   (/) = lift2 (/) "/"
   recip = lift1 recip "recip"
   fromRational = (constant undefined) . show . fromRational
@@ -302,11 +322,11 @@ addChild c n = do
   g <- get
   put $ g { nodes = IM.adjust (addChild' c) n ns }
 
-constant :: Typeable a => a -> String -> N a
-constant v info = mkNode (Cst (typeOf v) info []) >>= return . TRef
+constant :: (Storable a, Typeable a) => a -> String -> N a
+constant v info = mkNode (Cst (Type v) info []) >>= return . TRef
 
-input :: Typeable a => a -> String -> N a
-input v info = mkNode (In (typeOf v) info []) >>= return . TRef
+input :: (Storable a, Typeable a) => a -> String -> N a
+input v info = mkNode (In (Type v) info []) >>= return . TRef
 
 output info a = do
   TRef n1 <- a
@@ -321,20 +341,20 @@ out info (TRef n1) = do
   addChild n n1
   return (TRef n)
 
-lift1 :: (Typeable a, Typeable b) => (a -> b) -> String -> (N a -> N b)
+lift1 :: (Storable a, Storable b, Typeable a, Typeable b) => (a -> b) -> String -> (N a -> N b)
 lift1 f name = \a -> do
   r1 <- a
   op1 f name r1
 
 -- test for similar subgraph (not every nodes are checked, just the two
 -- added nodes are tested against each other, but it works).
-lift2' :: (Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
+lift2' :: (Storable a, Storable b, Storable c, Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
 lift2' f name = \a b ->
   if a `eq` b
    then do
     TRef n1 <- a
     rk1 <- gets (rank . (IM.! n1) . nodes)
-    n <- mkNode (Op (myTypeOf f) name [n1,n1] [] (rk1 + 1))
+    n <- mkNode (Op (myTypeOf f,Type $ f undefined undefined) name [n1,n1] [] (rk1 + 1))
     addChild n n1
     return (TRef n)
    else do
@@ -342,24 +362,24 @@ lift2' f name = \a b ->
     r2 <- b
     op2 f name r1 r2
 -- no test
-lift2 :: (Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
+lift2 :: (Storable a, Storable b, Storable c, Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
 lift2 f name = \a b -> do
   r1 <- a
   r2 <- b
   op2 f name r1 r2
 
-op1 :: (Typeable a, Typeable b) => (a -> b) -> String -> TRef a -> N b
+op1 :: (Storable a, Storable b, Typeable a, Typeable b) => (a -> b) -> String -> TRef a -> N b
 op1 f name (TRef n1) = do
   rk1 <- gets (rank . (IM.! n1) . nodes)
-  n <- mkNode (Op (myTypeOf f) name [n1] [] (rk1 + 1))
+  n <- mkNode (Op (myTypeOf f,Type $ f undefined) name [n1] [] (rk1 + 1))
   addChild n n1
   return (TRef n)
 
-op2 :: (Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> TRef a -> TRef b -> N c
+op2 :: (Storable a, Storable b, Storable c, Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> TRef a -> TRef b -> N c
 op2 f name (TRef n1) (TRef n2) = do
   rk1 <- gets (rank . (IM.! n1) . nodes)
   rk2 <- gets (rank . (IM.! n2) . nodes)
-  n <- mkNode (Op (myTypeOf f) name [n1,n2] [] (max rk1 rk2 + 1))
+  n <- mkNode (Op (myTypeOf f,Type $ f undefined undefined) name [n1,n2] [] (max rk1 rk2 + 1))
   addChild n n1
   addChild n n2
   return (TRef n)
