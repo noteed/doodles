@@ -1,4 +1,4 @@
-{-# LANGUAGE ViewPatterns, FlexibleInstances, TypeSynonymInstances, NoMonomorphismRestriction, ExistentialQuantification #-}
+{-# LANGUAGE ViewPatterns, FlexibleInstances, TypeSynonymInstances, NoMonomorphismRestriction, ExistentialQuantification, UndecidableInstances #-}
 -- 2009.01.08
 -- 2009.02.07
 -- autumnae
@@ -26,19 +26,21 @@ module Graph where
 
 import Control.Monad.State
 import qualified Data.IntMap as IM
+import Data.Maybe
 import Data.List
 import Data.Typeable
 import Data.Dynamic
 
 import Foreign.C.Types
 import Foreign.Storable
+import Foreign.Ptr
 import Foreign.ForeignPtr
 
 true = True
 false = False
 
-int = undefined :: Int
-float = undefined :: Float
+int = undefined :: CInt
+float = undefined :: CFloat
 
 -- Thanks to Ross Mellgren on the Haskell-Cafe mailing list.
 argsOf :: TypeRep -> [TypeRep]
@@ -88,8 +90,8 @@ type Rank = Int
 -- e.g. Op ([Int,Int],Int) "plus" [a,b] [c] means the node Plus depends
 -- on a and b (the parents) and c depends on it (c is a child of Plus).
 -- Furthermore the type of the parents should match with the one of the Op.
-data Node = Cst Type  String [Ref]
-          | In  Type  String [Ref]               -- children
+data Node = Cst Type  String [Ref]              -- children 
+          | In  Type  String [Ref]              -- children
           | Out Type  String [Ref] Rank         -- parents
           | Op ([TypeRep], Type) String [Ref] [Ref] Rank -- parents, children
   deriving Show
@@ -116,18 +118,28 @@ rank (Op _ _ _ _ rk) = rk
 
 parents (Cst _ _ _) = []
 parents (In _ _ _) = []
-parents (Out _ _ p _) = []
-parents (Op _ _ _ p _) = p
+parents (Out _ _ p _) = p
+parents (Op _ _ p _ _) = p
 
 children (Cst _ _ c) = c
 children (In _ _ c) = c
 children (Out _ _ _ _) = []
 children (Op _ _ _ c _) = c
 
-typeRep (Cst t _ _) = t
-typeRep (In t _ _) = t
-typeRep (Out t _ _ _) = t
-typeRep (Op (_,t) _ _ _ _) = t
+typ (Cst t _ _) = t
+typ (In t _ _) = t
+typ (Out t _ _ _) = t
+typ (Op (_,t) _ _ _ _) = t
+
+setChildren (Cst t i c)    c' = Cst t i c'
+setChildren (In t i c)     c' = In t i c'
+setChildren (Out t i p r)  _  = Out t i p r
+setChildren (Op t i p c r) c' = Op t i p c' r
+
+setParents (Cst t i c)    _  = Cst t i c
+setParents (In t i c)     _  = In t i c
+setParents (Out t i p r)  p' = Out t i p' r
+setParents (Op t i p c r) p' = Op t i p' c r
 
 ----------------------------------------------------------------------
 -- Graph
@@ -191,7 +203,7 @@ doDot g = do
 ----------------------------------------------------------------------
 
 vars g = map var (byrank g)
-var (r,node) = (cshow . typeRep) node ++ " " ++ cname (r,node) ++ ";" ++ " /* " ++ info node ++ " */"
+var (r,node) = (cshow . typ) node ++ " " ++ cname (r,node) ++ ";" ++ " /* " ++ info node ++ " */"
 cshow t | t == Type int = "int"
 cname (r,(Cst _ _ _)) = "cst" ++ show r
 cname (r,(In _ _ _)) = "inp" ++ show r
@@ -201,7 +213,7 @@ cname (r,(Out _ _ _ _)) = "out" ++ show r
 ups1 g = map up1 inputs
   where inputs = takeWhile (isIn . snd) (byrank g)
 up1 (r,node) = "void up" ++ show r ++ " ();\n"
-  ++ "void up_" ++ info node ++ " (" ++ (cshow . typeRep) node ++ " x" ++ ")\n{\n"
+  ++ "void up_" ++ info node ++ " (" ++ (cshow . typ) node ++ " x" ++ ")\n{\n"
   ++ cname (r,node) ++ " = x;\n"
   ++ "up" ++ show r ++ " ();\n"
   ++ "}\n"
@@ -237,7 +249,13 @@ doCode g = do
 -- Storable
 ----------------------------------------------------------------------
 
-data Type = forall a . (Storable a, Typeable a) => Type a
+class (Storable p, Typeable p) => Pointable p where
+  ptr :: Ptr p
+
+instance (Storable p, Typeable p) => Pointable p where
+  ptr = nullPtr
+
+data Type = forall a . Pointable a => Type a
 
 instance Show Type where
   show (Type a) = show (typeOf a)
@@ -248,16 +266,33 @@ instance Eq Type where
 mySizeOf (Type a) = sizeOf a
 myAlignment (Type a) = alignment a
 
-memory [] = (0,[])
-memory xs = (size,mem)
-  where (size,mem) = mapAccumL memoryAcc 0 xs
-memoryAcc off x = if re == 0 -- test if already aligned
-                    then (sx + off,      (off,     x))
-                    else (sx + off + al, (off + al,x))
-  where sx = mySizeOf x
-        ax = myAlignment x
+data Memory = Memory Int (IM.IntMap Node)
+  deriving Show
+
+-- Describe the graph as its data would be laid-off in a C struct :
+-- the size and a mapping with byte offset (respecting alignment)
+-- of the nodes.
+memory [] = Memory 0 IM.empty
+memory xs = Memory size (IM.fromList $ map snd mem)
+  where (size,mem) = mapAccumL (memoryAcc mem) 0 xs
+memoryAcc mem off x@(r,node) =
+  if re == 0 -- test if already aligned
+    then (sx + off,      (r,(off,     n')))
+    else (sx + off + al, (r,(off + al,n')))
+  where tx = typ $ snd x
+        sx = mySizeOf tx
+        ax = myAlignment tx
         re = off `mod` ax -- how much is needed if any
         al = ax - re      -- padding to regain alignment if needed
+        n  = setChildren node $ map (offset mem) (children node)
+        n' = setParents n $ map (offset mem) (parents n)
+
+-- translate from the map-ref (or alist-ref) to the memory-ref.
+offset mem r = fst . fromJust $ lookup r mem
+
+go (Memory size m) = do
+  mem <- mallocForeignPtrBytes size
+  return ()
 
 ----------------------------------------------------------------------
 -- Graph
@@ -293,14 +328,14 @@ same g1 g2 (n1,n2) =
                          Op t2 i2 p2 _ _ -> t1 == t2 && i1 == i2 && length p1 == length p2 && and (map (same g1 g2) (zip p1 p2))
                          otherwise       -> False
 
-instance (Storable n, Typeable n, Num n) => Num (N n) where
+instance (Pointable n, Num n) => Num (N n) where
   (+) = lift2 (+) "+"
   (*) = lift2 (*) "*"
   signum = lift1 signum "signumf"
   abs = lift1 abs "abs"
   fromInteger = (constant undefined) . show
 
-instance (Storable n, Typeable n, Fractional n) => Fractional (N n) where
+instance (Pointable n, Fractional n) => Fractional (N n) where
   (/) = lift2 (/) "/"
   recip = lift1 recip "recip"
   fromRational = (constant undefined) . show . fromRational
@@ -322,39 +357,39 @@ addChild c n = do
   g <- get
   put $ g { nodes = IM.adjust (addChild' c) n ns }
 
-constant :: (Storable a, Typeable a) => a -> String -> N a
+constant :: (Pointable a) => a -> String -> N a
 constant v info = mkNode (Cst (Type v) info []) >>= return . TRef
 
-input :: (Storable a, Typeable a) => a -> String -> N a
+input :: (Pointable a) => a -> String -> N a
 input v info = mkNode (In (Type v) info []) >>= return . TRef
 
 output info a = do
   TRef n1 <- a
   node <- gets ((IM.! n1) . nodes)
-  n <- mkNode (Out (typeRep node) info [n1] (rank node + 1))
+  n <- mkNode (Out (typ node) info [n1] (rank node + 1))
   addChild n n1
   return (TRef n)
 
 out info (TRef n1) = do
   node <- gets ((IM.! n1) . nodes)
-  n <- mkNode (Out (typeRep node) info [n1] (rank node + 1))
+  n <- mkNode (Out (typ node) info [n1] (rank node + 1))
   addChild n n1
   return (TRef n)
 
-lift1 :: (Storable a, Storable b, Typeable a, Typeable b) => (a -> b) -> String -> (N a -> N b)
+lift1 :: (Pointable a, Pointable b) => (a -> b) -> String -> (N a -> N b)
 lift1 f name = \a -> do
   r1 <- a
   op1 f name r1
 
 -- test for similar subgraph (not every nodes are checked, just the two
 -- added nodes are tested against each other, but it works).
-lift2' :: (Storable a, Storable b, Storable c, Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
+lift2' :: (Pointable a, Pointable b, Pointable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
 lift2' f name = \a b ->
   if a `eq` b
    then do
     TRef n1 <- a
     rk1 <- gets (rank . (IM.! n1) . nodes)
-    n <- mkNode (Op (myTypeOf f,Type $ f undefined undefined) name [n1,n1] [] (rk1 + 1))
+    n <- mkNode (Op (init $ myTypeOf f,Type $ f undefined undefined) name [n1,n1] [] (rk1 + 1))
     addChild n n1
     return (TRef n)
    else do
@@ -362,24 +397,24 @@ lift2' f name = \a b ->
     r2 <- b
     op2 f name r1 r2
 -- no test
-lift2 :: (Storable a, Storable b, Storable c, Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
+lift2 :: (Pointable a, Pointable b, Pointable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
 lift2 f name = \a b -> do
   r1 <- a
   r2 <- b
   op2 f name r1 r2
 
-op1 :: (Storable a, Storable b, Typeable a, Typeable b) => (a -> b) -> String -> TRef a -> N b
+op1 :: (Pointable a, Pointable b) => (a -> b) -> String -> TRef a -> N b
 op1 f name (TRef n1) = do
   rk1 <- gets (rank . (IM.! n1) . nodes)
-  n <- mkNode (Op (myTypeOf f,Type $ f undefined) name [n1] [] (rk1 + 1))
+  n <- mkNode (Op (init $ myTypeOf f,Type $ f undefined) name [n1] [] (rk1 + 1))
   addChild n n1
   return (TRef n)
 
-op2 :: (Storable a, Storable b, Storable c, Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> TRef a -> TRef b -> N c
+op2 :: (Pointable a, Pointable b, Pointable c) => (a -> b -> c) -> String -> TRef a -> TRef b -> N c
 op2 f name (TRef n1) (TRef n2) = do
   rk1 <- gets (rank . (IM.! n1) . nodes)
   rk2 <- gets (rank . (IM.! n2) . nodes)
-  n <- mkNode (Op (myTypeOf f,Type $ f undefined undefined) name [n1,n2] [] (max rk1 rk2 + 1))
+  n <- mkNode (Op (init $ myTypeOf f,Type $ f undefined undefined) name [n1,n2] [] (max rk1 rk2 + 1))
   addChild n n1
   addChild n n2
   return (TRef n)
@@ -391,7 +426,7 @@ add = op2 (+) "+"
 ----------------------------------------------------------------------
 
 foo = lift2 f "foo"
-f :: Int -> Float -> String
+f :: CInt -> CFloat -> String
 f x s = "hello"
 
 milliseconds = input int "milliseconds"
