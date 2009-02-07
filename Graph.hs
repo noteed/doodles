@@ -1,6 +1,6 @@
-{-# LANGUAGE ViewPatterns, FlexibleInstances, TypeSynonymInstances, NoMonomorphismRestriction #-}
+{-# LANGUAGE ViewPatterns, FlexibleInstances, TypeSynonymInstances, NoMonomorphismRestriction, ExistentialQuantification #-}
 -- 2009.01.08
--- 2009.02.02
+-- 2009.02.07
 -- autumnae
 --
 -- The graph is made of nodes named/referenced by Int's.
@@ -8,7 +8,7 @@
 -- have all the same type (i.e. Node).
 --
 -- To gain some safety from Haskell's type system,
--- function to create and combine nodes are typed :
+-- functions to create and combine nodes are typed :
 -- nodes have the same type (so they can be put inside
 -- a Map) but their reference are typed.
 --
@@ -30,6 +30,10 @@ import Data.List
 import Data.Typeable
 import Data.Dynamic
 
+import Foreign.C.Types
+import Foreign.Storable
+import Foreign.ForeignPtr
+
 true = True
 false = False
 
@@ -46,6 +50,10 @@ argsOf ty
 
 myTypeOf :: Typeable a => a -> [TypeRep]
 myTypeOf = argsOf . typeOf
+
+----------------------------------------------------------------------
+-- Node
+----------------------------------------------------------------------
 
 -- A reference is simply an Int. But to gain some type-safety
 -- the reference are wrapped (below).
@@ -104,6 +112,10 @@ typeRep (In t _ _) = t
 typeRep (Out t _ _ _) = t
 typeRep (Op t _ _ _ _) = last t
 
+----------------------------------------------------------------------
+-- Graph
+----------------------------------------------------------------------
+
 data G = G { nodes :: IM.IntMap Node, nextName :: Ref }
   deriving Show
 
@@ -114,19 +126,24 @@ emptyGraph = G IM.empty 0
 graph :: State G a -> IM.IntMap Node
 graph = nodes . (flip execState emptyGraph)
 
-alist = IM.toList . graph
+alist = IM.toList
 
--- Returns all the nodes sorted by their rank (so Inputs and Constans come first).
-byrank g = sortBy (\a b -> (rank . snd) a `compare` (rank . snd) b) (alist g)
+-- Returns all the nodes sorted by their rank (so Inputs and Constants come first).
+byrank = sortByRank . alist
+sortByRank = sortBy (\a b -> (rank . snd) a `compare` (rank . snd) b)
 
 -- Groups all the nodes according to their rank (with Inputs and
 -- Constants coming first).
 grouped g = groupBy (\a b -> (rank . snd) a == (rank . snd) b) (byrank g)
 
--- Gives the list of node which depends on the node (referenced by n).
-below g n = tail $ below' n
-  where below' n = let n' = l n in (n,n') : concatMap below' (children n')
-        l n = (graph g) IM.! n
+-- Gives the list of node which depends on the node (referenced by r).
+below g r = tail $ below' r
+  where below' r = let n = l r in (r,n) : concatMap below' (children n)
+        l r = g IM.! r
+
+----------------------------------------------------------------------
+-- Dot
+----------------------------------------------------------------------
 
 -- nodes
 dotOne1 (r,node) = "n" ++ show r ++ " [" ++
@@ -145,11 +162,86 @@ dotRank2 = concatMap dotOne2
 dot2 = (concatMap dotRank2) . grouped
 
 doDot g = do
+  let g' = graph g
   putStrLn "digraph G {"
-  putStr $ dot1 g
+  putStr $ dot1 g'
   putStrLn ""
-  putStr $ dot2 g
+  putStr $ dot2 g'
   putStrLn "}"
+
+----------------------------------------------------------------------
+-- C
+----------------------------------------------------------------------
+
+vars g = map var (byrank g)
+var (r,node) = (cshow . typeRep) node ++ " " ++ cname (r,node) ++ ";" ++ " /* " ++ info node ++ " */"
+cshow t | t == typeOf int = "int"
+cname (r,(Cst _ _ _)) = "cst" ++ show r
+cname (r,(In _ _ _)) = "inp" ++ show r
+cname (r,(Op _ _ _ _ _)) = "nod" ++ show r
+cname (r,(Out _ _ _ _)) = "out" ++ show r
+
+ups1 g = map up1 inputs
+  where inputs = takeWhile (isIn . snd) (byrank g)
+up1 (r,node) = "void up" ++ show r ++ " ();\n"
+  ++ "void up_" ++ info node ++ " (" ++ (cshow . typeRep) node ++ " x" ++ ")\n{\n"
+  ++ cname (r,node) ++ " = x;\n"
+  ++ "up" ++ show r ++ " ();\n"
+  ++ "}\n"
+
+ups2 g = map (up2 g) inputs
+  where inputs = takeWhile (isIn . snd) (byrank g)
+up2 g (r,node) = "void up" ++ show r ++ " ()\n{\n" ++ body (r,node) g ++ "\n}"
+body (r,node) g = concatMap (upNode g) depends
+  where depends = sortByRank $ below g r
+upNode g (r,node) | isOut node = "" -- no data to update for an output node
+                  | isIn  node = error "input node shouldn't be updated from here"
+                  | isCst node = "" -- no update for a constant node
+                  | isOp  node = upOp g (r,node)
+upOp g (r,node@(Op ts info ps cs rk)) = upOp' g (r,node)
+upOp' g (r,node@(Op ts "+" [a,b] _ _)) | ts == [typeOf int, typeOf int, typeOf int] =
+  cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " + " ++ cname (b,g IM.! b) ++ ";"
+
+outs g = concatMap outOne funs
+  where outputs = filter (isOut . snd) (alist g)
+        funs = map (info . snd) $ nubBy (\(_,node1) (_,node2) -> info node1 == info node2) outputs
+        outOne name = "void out_" ++ name ++ " ()\n{\n" ++ body name ++ "\n}"
+        body name = concatMap call $ filter ((== name) . info . snd) outputs
+        call (r,node) = info node ++ " (" ++ cname (r,node) ++ ");"
+
+doCode g = do
+  let g' = graph g
+  putStrLn $ unlines $ vars g'
+  putStrLn $ unlines $ ups1 g'
+  putStrLn $ unlines $ ups2 g'
+  putStrLn $ outs g'
+
+----------------------------------------------------------------------
+-- Storable
+----------------------------------------------------------------------
+
+data Wrap = forall a . (Storable a, Typeable a) => Wrap a
+
+instance Show Wrap where
+  show (Wrap a) = show (typeOf a)
+
+mySizeOf (Wrap a) = sizeOf a
+myAlignment (Wrap a) = alignment a
+
+memory [] = (0,[])
+memory xs = (size,mem)
+  where (size,mem) = mapAccumL memoryAcc 0 xs
+memoryAcc off x = if re == 0 -- test if already aligned
+                    then (sx + off,      (off,     x))
+                    else (sx + off + al, (off + al,x))
+  where sx = mySizeOf x
+        ax = myAlignment x
+        re = off `mod` ax -- how much is needed if any
+        al = ax - re      -- padding to regain alignment if needed
+
+----------------------------------------------------------------------
+-- Graph
+----------------------------------------------------------------------
 
 instance Show (State G a) where
   show g = show $ execState g emptyGraph
@@ -193,9 +285,9 @@ instance (Typeable n, Fractional n) => Fractional (N n) where
   recip = lift1 recip "recip"
   fromRational = (constant undefined) . show . fromRational
 
-addChild' c (Cst t info cs) = Cst t info (c:cs)
-addChild' c (In t info cs) = In t info (c:cs)
-addChild' c (Op t info ps cs rk) = Op t info ps (c:cs) rk
+addChild' c n@(Cst t info cs) = if c `elem` cs then n else Cst t info (c:cs)
+addChild' c n@(In t info cs) = if c `elem` cs then n else In t info (c:cs)
+addChild' c n@(Op t info ps cs rk) = if c `elem` cs then n else Op t info ps (c:cs) rk
 
 -- Create a node (and give it automatically a name).
 mkNode n = do
@@ -274,6 +366,10 @@ op2 f name (TRef n1) (TRef n2) = do
 
 add = op2 (+) "+"
 
+----------------------------------------------------------------------
+-- Examples
+----------------------------------------------------------------------
+
 foo = lift2 f "foo"
 f :: Int -> Float -> String
 f x s = "hello"
@@ -302,9 +398,9 @@ ex2 = output "yah" $ a + a
 ex3 = output "yah-shared" $ a +++ a
   where a = (milliseconds + 12 + 46)
 
--- no problem to discover sharing here.
+-- no problem to discover sharing here but more ugly syntax.
 ex4 = do
-  m <- input int "milliseconds"
+  m <- milliseconds
   a <- add m m
-  out "out" a
+  out "console" a
   return ()
