@@ -1,4 +1,4 @@
-{-# LANGUAGE ViewPatterns, FlexibleInstances, TypeSynonymInstances #-}
+{-# LANGUAGE ViewPatterns, FlexibleInstances, TypeSynonymInstances, NoMonomorphismRestriction #-}
 -- 2009.01.08
 -- 2009.02.02
 -- autumnae
@@ -111,7 +111,7 @@ type N a = State G (TRef a)
 
 emptyGraph = G IM.empty 0
 
-graph :: N a -> IM.IntMap Node
+graph :: State G a -> IM.IntMap Node
 graph = nodes . (flip execState emptyGraph)
 
 alist = IM.toList . graph
@@ -151,7 +151,7 @@ doDot g = do
   putStr $ dot2 g
   putStrLn "}"
 
-instance Show (N w) where
+instance Show (State G a) where
   show g = show $ execState g emptyGraph
 
 instance Eq (N w) where
@@ -204,11 +204,6 @@ mkNode n = do
   put $ G { nodes = IM.insert i n ns, nextName = i + 1 }
   return i
 
--- Add a node named (refenced by) i.
-addNode i n = do
-  ns <- gets nodes
-  put $ G { nodes = IM.insert i n ns, nextName = i + 1 }
-
 -- Add c as a child to the node n.
 addChild c n = do
   ns <- gets nodes
@@ -221,22 +216,23 @@ constant v info = mkNode (Cst (typeOf v) info []) >>= return . TRef
 input :: Typeable a => a -> String -> N a
 input v info = mkNode (In (typeOf v) info []) >>= return . TRef
 
-out info a = do
+output info a = do
   TRef n1 <- a
   node <- gets ((IM.! n1) . nodes)
-  n <- gets nextName
+  n <- mkNode (Out (typeRep node) info [n1] (rank node + 1))
   addChild n n1
-  addNode n (Out (typeRep node) info [n1] (rank node + 1))
+  return (TRef n)
+
+out info (TRef n1) = do
+  node <- gets ((IM.! n1) . nodes)
+  n <- mkNode (Out (typeRep node) info [n1] (rank node + 1))
+  addChild n n1
   return (TRef n)
 
 lift1 :: (Typeable a, Typeable b) => (a -> b) -> String -> (N a -> N b)
 lift1 f name = \a -> do
-  TRef n1 <- a
-  rk <- gets (rank . (IM.! n1) . nodes)
-  n <- gets nextName
-  addChild n n1
-  addNode n (Op (myTypeOf f) name [n1] [] (rk + 1))
-  return (TRef n)
+  r1 <- a
+  op1 f name r1
 
 -- test for similar subgraph (not every nodes are checked, just the two
 -- added nodes are tested against each other, but it works).
@@ -246,32 +242,37 @@ lift2' f name = \a b ->
    then do
     TRef n1 <- a
     rk1 <- gets (rank . (IM.! n1) . nodes)
-    n <- gets nextName
+    n <- mkNode (Op (myTypeOf f) name [n1,n1] [] (rk1 + 1))
     addChild n n1
-    addNode n (Op (myTypeOf f) name [n1,n1] [] (rk1 + 1))
     return (TRef n)
    else do
-    TRef n1 <- a
-    TRef n2 <- b
-    rk1 <- gets (rank . (IM.! n1) . nodes)
-    rk2 <- gets (rank . (IM.! n2) . nodes)
-    n <- gets nextName
-    addChild n n1
-    addChild n n2
-    addNode n (Op (myTypeOf f) name [n1,n2] [] (max rk1 rk2 + 1))
-    return (TRef n)
+    r1 <- a
+    r2 <- b
+    op2 f name r1 r2
 -- no test
 lift2 :: (Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
 lift2 f name = \a b -> do
-  TRef n1 <- a
-  TRef n2 <- b
+  r1 <- a
+  r2 <- b
+  op2 f name r1 r2
+
+op1 :: (Typeable a, Typeable b) => (a -> b) -> String -> TRef a -> N b
+op1 f name (TRef n1) = do
+  rk1 <- gets (rank . (IM.! n1) . nodes)
+  n <- mkNode (Op (myTypeOf f) name [n1] [] (rk1 + 1))
+  addChild n n1
+  return (TRef n)
+
+op2 :: (Typeable a, Typeable b, Typeable c) => (a -> b -> c) -> String -> TRef a -> TRef b -> N c
+op2 f name (TRef n1) (TRef n2) = do
   rk1 <- gets (rank . (IM.! n1) . nodes)
   rk2 <- gets (rank . (IM.! n2) . nodes)
-  n <- gets nextName
+  n <- mkNode (Op (myTypeOf f) name [n1,n2] [] (max rk1 rk2 + 1))
   addChild n n1
   addChild n n2
-  addNode n (Op (myTypeOf f) name [n1,n2] [] (max rk1 rk2 + 1))
   return (TRef n)
+
+add = op2 (+) "+"
 
 foo = lift2 f "foo"
 f :: Int -> Float -> String
@@ -279,7 +280,7 @@ f x s = "hello"
 
 milliseconds = input int "milliseconds"
 
-ex1 = out "hey" $ (milliseconds + 45) `foo` (55.6 * 1.2)
+ex1 = output "hey" $ (milliseconds + 45) `foo` (55.6 * 1.2)
 
 ex1' = execState ex1 emptyGraph
 
@@ -295,9 +296,15 @@ ex1' = execState ex1 emptyGraph
 -- is checked against every existing node. Maybe it
 -- would be expensive but it could find redondant
 -- node even if they were not initially shared.
-ex2 = out "yah" $ a + a
+ex2 = output "yah" $ a + a
   where a = (milliseconds + 12 + 46)
 (+++) = lift2' (+) "+check"
-ex3 = out "yah-again" $ a +++ a
+ex3 = output "yah-shared" $ a +++ a
   where a = (milliseconds + 12 + 46)
 
+-- no problem to discover sharing here.
+ex4 = do
+  m <- input int "milliseconds"
+  a <- add m m
+  out "out" a
+  return ()
