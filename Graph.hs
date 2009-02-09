@@ -1,7 +1,7 @@
 {-# LANGUAGE ViewPatterns, FlexibleInstances, TypeSynonymInstances, NoMonomorphismRestriction, ExistentialQuantification, UndecidableInstances #-}
 -- 2009.01.08
--- 2009.02.07
--- autumnae
+-- 2009.02.09
+-- Vo Minh Thu
 --
 -- The graph is made of nodes named/referenced by Int's.
 -- Nodes have a field denoting their type, but otherwise
@@ -21,6 +21,8 @@
 --
 -- 'usage' : in ghci : doDot ex1
 -- or : ghc Graph.hs -e 'doDot ex1' | dot -Tsvg -oex1.svg
+-- or : ghc -e "putStrLn $ doCode ex4" Graph.hs
+-- or : ghc -e "ttcCode $ doCode ex4" Graph.hs
 --
 module Graph where
 
@@ -35,6 +37,9 @@ import Foreign.C.Types
 import Foreign.Storable
 import Foreign.Ptr
 import Foreign.ForeignPtr
+
+import Language.TCC
+import Foreign.C.String
 
 true = True
 false = False
@@ -203,7 +208,7 @@ doDot g = do
 ----------------------------------------------------------------------
 
 vars g = map var (byrank g)
-var (r,node) = (cshow . typ) node ++ " " ++ cname (r,node) ++ ";" ++ " /* " ++ info node ++ " */"
+var (r,node) = if isOut node then "" else (cshow . typ) node ++ " " ++ cname (r,node) ++ ";" ++ " /* " ++ info node ++ " */"
 cshow t | t == Type int = "int"
 cname (r,(Cst _ _ _)) = "cst" ++ show r
 cname (r,(In _ _ _)) = "inp" ++ show r
@@ -228,22 +233,58 @@ upNode g (r,node) | isOut node = "" -- no data to update for an output node
                   | isCst node = "" -- no update for a constant node
                   | isOp  node = upOp g (r,node)
 upOp g (r,node@(Op ts info ps cs rk)) = upOp' g (r,node)
-upOp' g (r,node@(Op (ts,_) "+" [a,b] _ _)) | ts == [typeOf int, typeOf int, typeOf int] =
-  cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " + " ++ cname (b,g IM.! b) ++ ";"
+upOp' g (r,node@(Op (ts,t) info [a,b] _ _))
+  | ts == [typeOf int, typeOf int] && t == Type int && info == "+" =
+    cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " + " ++ cname (b,g IM.! b) ++ ";"
+  | otherwise =
+    info ++ " (" ++ cname (r,node) ++ ", " ++ cname (a,g IM.! a) ++ ", " ++ cname (b,g IM.! b) ++ ");"
 
 outs g = concatMap outOne funs
   where outputs = filter (isOut . snd) (alist g)
         funs = map (info . snd) $ nubBy (\(_,node1) (_,node2) -> info node1 == info node2) outputs
         outOne name = "void out_" ++ name ++ " ()\n{\n" ++ body name ++ "\n}"
         body name = concatMap call $ filter ((== name) . info . snd) outputs
-        call (r,node) = info node ++ " (" ++ cname (r,node) ++ ");"
+        call (r,node) = info node ++ " (" ++ cname ((head $ parents node),g IM.! (head $ parents node)) ++ ");"
 
-doCode g = do
-  let g' = graph g
-  putStrLn $ unlines $ vars g'
-  putStrLn $ unlines $ ups1 g'
-  putStrLn $ unlines $ ups2 g'
-  putStrLn $ outs g'
+doCode ::  State G a -> String
+doCode g = let g' = graph g in
+  "#include <stdio.h>"
+  ++" /* The loop can call the up_<input> and out_<output> functions. */\n"
+  ++ " /* The <output> functions should be provided.                   */\n"
+  ++ "void console (int i) { printf (\"%d\\n\", i); }\n"
+  ++ (unlines $ vars g')
+  ++ (unlines $ ups1 g')
+  ++ (unlines $ ups2 g')
+  ++ (outs g')
+  ++ "\n"
+  ++ "void loop ()\n"
+  ++ "{\n"
+  ++ "  up_milliseconds (100);\n"
+  ++ "  up_milliseconds (200);\n"
+  ++ "  out_console ();\n"
+  ++ "  up_milliseconds (300);\n"
+  ++ "  up_milliseconds (400);\n"
+  ++ "  out_console ();\n"
+  ++ "  up_milliseconds (500);\n"
+  ++ "  up_milliseconds (600);\n"
+  ++ "  out_console ();\n"
+  ++ "}\n"
+  ++ "int main ()\n"
+  ++ "{\n"
+  ++ "  loop ();\n"
+  ++ "  return 0;\n"
+  ++ "}\n"
+
+ttcCode code = do
+  putStrLn "Execution."
+  s <- c_new
+  c_set_output_type s tcc_OUTPUT_MEMORY
+  withCString code (c_compile_string s)
+  c_relocate s
+  Just addr <- getSymbol s "loop"
+  c_call addr
+  c_delete s
+  putStrLn "Done."
 
 ----------------------------------------------------------------------
 -- Storable
@@ -419,6 +460,7 @@ op2 f name (TRef n1) (TRef n2) = do
   addChild n n2
   return (TRef n)
 
+add :: TRef CInt -> TRef CInt -> N CInt
 add = op2 (+) "+"
 
 ----------------------------------------------------------------------
