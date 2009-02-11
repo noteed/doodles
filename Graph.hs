@@ -58,6 +58,16 @@ argsOf ty
 myTypeOf :: Typeable a => a -> [TypeRep]
 myTypeOf = argsOf . typeOf
 
+data TypeDepiction = TDInt
+                   | TDFloat
+  deriving (Eq, Ord, Show)
+
+repDepiction t | t == typeOf int   = TDInt
+               | t == typeOf float = TDFloat
+               | otherwise = error $ "Attempt to get a TypeDepiction from an unsupported type : " ++ show t ++ "."
+
+typeDepiction = (map repDepiction) . myTypeOf
+
 instance Storable String where
   -- sizeOf :: a -> Int
   -- alignment :: a -> Int
@@ -95,55 +105,55 @@ type Rank = Int
 -- e.g. Op ([Int,Int],Int) "plus" [a,b] [c] means the node Plus depends
 -- on a and b (the parents) and c depends on it (c is a child of Plus).
 -- Furthermore the type of the parents should match with the one of the Op.
-data Node = Cst Type  String [Ref]              -- children 
-          | In  Type  String [Ref]              -- children
-          | Out Type  String [Ref] Rank         -- parents
-          | Op ([TypeRep], Type) String [Ref] [Ref] Rank -- parents, children
+data Node = Cst TypeDepiction String [Ref]              -- children 
+          | In  TypeDepiction String [Ref]              -- children
+          | Out               String [Ref] Rank         -- parents
+          | Op  [TypeDepiction] String [Ref] [Ref] Rank -- parents, children
   deriving Show
 
 isCst (Cst _ _ _) = True
 isCst _ = False
 isIn (In _ _ _) = True
 isIn _ = False
-isOut (Out _ _ _ _) = True
+isOut (Out _ _ _) = True
 isOut _ = False
 isOp (Op _ _ _ _ _) = True
 isOp _ = False
 
 info (Cst _ i _) = i
 info (In _ i _) = i
-info (Out _ i _ _) = i
+info (Out i _ _) = i
 info (Op _ i _ _ _) = i
 
 rank :: Node -> Rank
 rank (Cst _ _ _) = 0
 rank (In _ _ _) = 0
-rank (Out _ _ _ rk) = rk
+rank (Out _ _ rk) = rk
 rank (Op _ _ _ _ rk) = rk
 
 parents (Cst _ _ _) = []
 parents (In _ _ _) = []
-parents (Out _ _ p _) = p
+parents (Out _ p _) = p
 parents (Op _ _ p _ _) = p
 
 children (Cst _ _ c) = c
 children (In _ _ c) = c
-children (Out _ _ _ _) = []
+children (Out _ _ _) = []
 children (Op _ _ _ c _) = c
 
 typ (Cst t _ _) = t
 typ (In t _ _) = t
-typ (Out t _ _ _) = t
-typ (Op (_,t) _ _ _ _) = t
+typ (Out _ _ _) = error "Attempt to get the type of an Out node."
+typ (Op ts _ _ _ _) = last ts
 
 setChildren (Cst t i c)    c' = Cst t i c'
 setChildren (In t i c)     c' = In t i c'
-setChildren (Out t i p r)  _  = Out t i p r
+setChildren (Out i p r)  _  = Out i p r
 setChildren (Op t i p c r) c' = Op t i p c' r
 
 setParents (Cst t i c)    _  = Cst t i c
 setParents (In t i c)     _  = In t i c
-setParents (Out t i p r)  p' = Out t i p' r
+setParents (Out i p r)  p' = Out i p' r
 setParents (Op t i p c r) p' = Op t i p' c r
 
 ----------------------------------------------------------------------
@@ -209,11 +219,12 @@ doDot g = do
 
 vars g = map var (byrank g)
 var (r,node) = if isOut node then "" else (cshow . typ) node ++ " " ++ cname (r,node) ++ ";" ++ " /* " ++ info node ++ " */"
-cshow t | t == Type int = "int"
+cshow TDInt   = "int"
+cshow TDFloat = "float"
 cname (r,(Cst _ _ _)) = "cst" ++ show r
 cname (r,(In _ _ _)) = "inp" ++ show r
 cname (r,(Op _ _ _ _ _)) = "nod" ++ show r
-cname (r,(Out _ _ _ _)) = "out" ++ show r
+cname (r,(Out _ _ _)) = "out" ++ show r
 
 ups1 g = map up1 inputs
   where inputs = takeWhile (isIn . snd) (byrank g)
@@ -233,8 +244,8 @@ upNode g (r,node) | isOut node = "" -- no data to update for an output node
                   | isCst node = "" -- no update for a constant node
                   | isOp  node = upOp g (r,node)
 upOp g (r,node@(Op ts info ps cs rk)) = upOp' g (r,node)
-upOp' g (r,node@(Op (ts,t) info [a,b] _ _))
-  | ts == [typeOf int, typeOf int] && t == Type int && info == "+" =
+upOp' g (r,node@(Op ts info [a,b] _ _))
+  | ts == [TDInt, TDInt, TDInt] && info == "+" =
     cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " + " ++ cname (b,g IM.! b) ++ ";"
   | otherwise =
     info ++ " (" ++ cname (r,node) ++ ", " ++ cname (a,g IM.! a) ++ ", " ++ cname (b,g IM.! b) ++ ");"
@@ -244,7 +255,9 @@ outs g = concatMap outOne funs
         funs = map (info . snd) $ nubBy (\(_,node1) (_,node2) -> info node1 == info node2) outputs
         outOne name = "void out_" ++ name ++ " ()\n{\n" ++ body name ++ "\n}"
         body name = concatMap call $ filter ((== name) . info . snd) outputs
-        call (r,node) = info node ++ " (" ++ cname ((head $ parents node),g IM.! (head $ parents node)) ++ ");"
+        call (r,node) = info node ++ " (" ++ intercalate ", " (map (cname' g) (parents node)) ++ ");"
+
+cname' g r = cname (r,g IM.! r)
 
 doCode ::  State G a -> String
 doCode g = let g' = graph g in
@@ -296,16 +309,11 @@ class (Storable p, Typeable p) => Pointable p where
 instance (Storable p, Typeable p) => Pointable p where
   ptr = nullPtr
 
-data Type = forall a . Pointable a => Type a
+mySizeOf TDInt   = sizeOf int
+mySizeOf TDFloat = sizeOf float
 
-instance Show Type where
-  show (Type a) = show (typeOf a)
-
-instance Eq Type where
-  (Type a) == (Type b)= (typeOf a) == (typeOf b)
-
-mySizeOf (Type a) = sizeOf a
-myAlignment (Type a) = alignment a
+myAlignment TDInt   = alignment int
+myAlignment TDFloat = alignment float
 
 data Memory = Memory Int (IM.IntMap Node)
   deriving Show
@@ -362,8 +370,8 @@ same g1 g2 (n1,n2) =
     In t1 i1 _      -> case (g2 IM.! n2) of
                          In t2 i2 _ -> t1 == t2 && i1 == i2
                          otherwise   -> False
-    Out t1 i1 p1 _  -> case (g2 IM.! n2) of
-                         Out t2 i2 p2 _ -> t1 == t2 && i1 == i2 && length p1 == length p2 && and (map (same g1 g2) (zip p1 p2))
+    Out i1 p1 _  -> case (g2 IM.! n2) of
+                         Out i2 p2 _ -> i1 == i2 && length p1 == length p2 && and (map (same g1 g2) (zip p1 p2))
                          otherwise   -> False
     Op t1 i1 p1 _ _ -> case (g2 IM.! n2) of
                          Op t2 i2 p2 _ _ -> t1 == t2 && i1 == i2 && length p1 == length p2 && and (map (same g1 g2) (zip p1 p2))
@@ -399,22 +407,30 @@ addChild c n = do
   put $ g { nodes = IM.adjust (addChild' c) n ns }
 
 constant :: (Pointable a) => a -> String -> N a
-constant v info = mkNode (Cst (Type v) info []) >>= return . TRef
+constant v info = mkNode (Cst (head $ typeDepiction v) info []) >>= return . TRef
 
 input :: (Pointable a) => a -> String -> N a
-input v info = mkNode (In (Type v) info []) >>= return . TRef
+input v info = mkNode (In (head $ typeDepiction v) info []) >>= return . TRef
 
 output info a = do
   TRef n1 <- a
   node <- gets ((IM.! n1) . nodes)
-  n <- mkNode (Out (typ node) info [n1] (rank node + 1))
+  n <- mkNode (Out info [n1] (rank node + 1))
   addChild n n1
   return (TRef n)
 
 out info (TRef n1) = do
-  node <- gets ((IM.! n1) . nodes)
-  n <- mkNode (Out (typ node) info [n1] (rank node + 1))
+  rk <- gets (rank . (IM.! n1) . nodes)
+  n <- mkNode (Out info [n1] (rk + 1))
   addChild n n1
+  return ()
+
+-- works on Ref's, not on TRef's.
+multiOut info refs = do
+  ns <- gets nodes
+  let rk = maximum $ map (rank . (ns IM.!)) refs
+  n <- mkNode (Out info refs (rk + 1))
+  mapM_ (addChild n) refs
   return (TRef n)
 
 lift1 :: (Pointable a, Pointable b) => (a -> b) -> String -> (N a -> N b)
@@ -430,7 +446,7 @@ lift2' f name = \a b ->
    then do
     TRef n1 <- a
     rk1 <- gets (rank . (IM.! n1) . nodes)
-    n <- mkNode (Op (init $ myTypeOf f,Type $ f undefined undefined) name [n1,n1] [] (rk1 + 1))
+    n <- mkNode (Op (typeDepiction f) name [n1,n1] [] (rk1 + 1))
     addChild n n1
     return (TRef n)
    else do
@@ -447,7 +463,7 @@ lift2 f name = \a b -> do
 op1 :: (Pointable a, Pointable b) => (a -> b) -> String -> TRef a -> N b
 op1 f name (TRef n1) = do
   rk1 <- gets (rank . (IM.! n1) . nodes)
-  n <- mkNode (Op (init $ myTypeOf f,Type $ f undefined) name [n1] [] (rk1 + 1))
+  n <- mkNode (Op (typeDepiction f) name [n1] [] (rk1 + 1))
   addChild n n1
   return (TRef n)
 
@@ -455,7 +471,7 @@ op2 :: (Pointable a, Pointable b, Pointable c) => (a -> b -> c) -> String -> TRe
 op2 f name (TRef n1) (TRef n2) = do
   rk1 <- gets (rank . (IM.! n1) . nodes)
   rk2 <- gets (rank . (IM.! n2) . nodes)
-  n <- mkNode (Op (init $ myTypeOf f,Type $ f undefined undefined) name [n1,n2] [] (max rk1 rk2 + 1))
+  n <- mkNode (Op (typeDepiction f) name [n1,n2] [] (max rk1 rk2 + 1))
   addChild n n1
   addChild n n2
   return (TRef n)
@@ -500,4 +516,4 @@ ex4 = do
   m <- milliseconds
   a <- add m m
   out "console" a
-  return ()
+
