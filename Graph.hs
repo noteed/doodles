@@ -78,6 +78,9 @@ sizeof TDFloat = sizeOf float
 alignmentof TDInt   = alignment int
 alignmentof TDFloat = alignment float
 
+typeShow TDInt   = "int"
+typeShow TDFloat = "float"
+
 
 ----------------------------------------------------------------------
 -- Node
@@ -211,9 +214,9 @@ writeDot fn g = writeFile fn (doDot g)
 ----------------------------------------------------------------------
 
 vars g = map var (byrank g)
-var (r,node) = if isOut node then "" else (cshow . typ) node ++ " " ++ cname (r,node) ++ ";" ++ " /* " ++ info node ++ " */"
-cshow TDInt   = "int"
-cshow TDFloat = "float"
+var (r,node) | isOut node = ""
+             | isCst node = (typeShow . typ) node ++ " " ++ cname (r,node) ++ " = " ++ info node ++ ";"
+             | otherwise  = (typeShow . typ) node ++ " " ++ cname (r,node) ++ ";" ++ " /* " ++ info node ++ " */"
 cname (r,(Cst _ _ _)) = "cst" ++ show r
 cname (r,(In _ _ _)) = "inp" ++ show r
 cname (r,(Op _ _ _ _ _)) = "nod" ++ show r
@@ -222,7 +225,7 @@ cname (r,(Out _ _ _)) = "out" ++ show r
 ups1 g = map up1 inputs
   where inputs = takeWhile (isIn . snd) (byrank g)
 up1 (r,node) = "void up" ++ show r ++ " ();\n"
-  ++ "void up_" ++ info node ++ " (" ++ (cshow . typ) node ++ " x" ++ ")\n{\n"
+  ++ "void up_" ++ info node ++ " (" ++ (typeShow . typ) node ++ " x" ++ ")\n{\n"
   ++ cname (r,node) ++ " = x;\n"
   ++ "up" ++ show r ++ " ();\n"
   ++ "}\n"
@@ -239,9 +242,11 @@ upNode g (r,node) | isOut node = "" -- no data to update for an output node
 upOp g (r,node@(Op ts info ps cs rk)) = upOp' g (r,node)
 upOp' g (r,node@(Op ts info [a,b] _ _))
   | ts == [TDInt, TDInt, TDInt] && info == "+" =
-    cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " + " ++ cname (b,g IM.! b) ++ ";"
+    cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " + " ++ cname (b,g IM.! b) ++ ";\n"
+  | ts == [TDInt, TDInt, TDInt] && info == "-" =
+    cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " - " ++ cname (b,g IM.! b) ++ ";\n"
   | otherwise =
-    info ++ " (" ++ cname (r,node) ++ ", " ++ cname (a,g IM.! a) ++ ", " ++ cname (b,g IM.! b) ++ ");"
+    info ++ " (" ++ cname (r,node) ++ ", " ++ cname (a,g IM.! a) ++ ", " ++ cname (b,g IM.! b) ++ ");\n"
 
 outs g = concatMap outOne funs
   where outputs = filter (isOut . snd) (alist g)
@@ -360,9 +365,11 @@ same g1 g2 (n1,n2) =
 
 instance (IsType n, Num n) => Num (N n) where
   (+) = lift2 (+) "+"
+  (-) = lift2 (-) "-"
   (*) = lift2 (*) "*"
-  signum = lift1 signum "signumf"
+  negate = lift1 negate "negate"
   abs = lift1 abs "abs"
+  signum = lift1 signum "signumf"
   fromInteger = (constant undefined) . show
 
 instance (IsType n, Fractional n) => Fractional (N n) where
@@ -486,7 +493,7 @@ ex1' = execState ex1 emptyGraph
 -- is checked against every existing node. Maybe it
 -- would be expensive but it could find redondant
 -- node even if they were not initially shared.
-ex2 = output "yah" $ a + a
+ex2 = output "yah" $ a - a
   where a = (milliseconds + 12 + 46)
 (+++) = lift2' (+) "+check"
 ex3 = output "yah-shared" $ a +++ a
@@ -498,11 +505,11 @@ ex4 = do
   a <- add m m
   out "console" a
 
--- Like 'let', for sharing.
-with :: N a -> (N a -> N b) -> N b
-with x f = x >>= (f . return)
+-- Better solution (thanks to Oleg Kiselyov) : like 'let', for sharing.
+share :: N a -> (N a -> N b) -> N b
+share x f = x >>= (f . return)
 
--- sharing occurs !
-ex5 = with (milliseconds + 5) (\a -> output "console" $ a + a)
+-- sharing occures !
+ex5 = share (milliseconds + 5) (\a -> output "console" $ a + a - 2)
 
 
