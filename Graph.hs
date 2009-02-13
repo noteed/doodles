@@ -20,7 +20,7 @@
 -- node. Maybe I could use TH to generate some of this stuff.
 --
 -- 'usage' : in ghci : doDot ex1
--- or : ghc Graph.hs -e 'doDot ex1' | dot -Tsvg -oex1.svg
+-- or : ghc Graph.hs -e 'putStrLn $ doDot ex1' | dot -Tsvg -oex1.svg
 -- or : ghc -e "putStrLn $ doCode ex4" Graph.hs
 -- or : ghc -e "ttcCode $ doCode ex4" Graph.hs
 --
@@ -30,8 +30,6 @@ import Control.Monad.State
 import qualified Data.IntMap as IM
 import Data.Maybe
 import Data.List
-import Data.Typeable
-import Data.Dynamic
 
 import Foreign.C.Types
 import Foreign.Storable
@@ -47,43 +45,39 @@ false = False
 int = undefined :: CInt
 float = undefined :: CFloat
 
--- Thanks to Ross Mellgren on the Haskell-Cafe mailing list.
-argsOf :: TypeRep -> [TypeRep]
-argsOf ty
-  | typeRepTyCon ty == funTyCon = let ([x,y]) = typeRepArgs ty in x : argsOf y
-  | otherwise = [ty] -- 'return' type
-  where funTyCon :: TyCon
-        funTyCon = mkTyCon "->"
-
-myTypeOf :: Typeable a => a -> [TypeRep]
-myTypeOf = argsOf . typeOf
-
 data TypeDepiction = TDInt
                    | TDFloat
+                   | TDString
   deriving (Eq, Ord, Show)
 
-repDepiction t | t == typeOf int   = TDInt
-               | t == typeOf float = TDFloat
-               | otherwise = error $ "Attempt to get a TypeDepiction from an unsupported type : " ++ show t ++ "."
+class IsType a where
+  typeDepiction :: a -> TypeDepiction
 
-typeDepiction = (map repDepiction) . myTypeOf
+instance IsType CInt where
+  typeDepiction _ = TDInt
 
-instance Storable String where
-  -- sizeOf :: a -> Int
-  -- alignment :: a -> Int
-  -- peekElemOff :: Ptr a -> Int -> IO a
-  -- pokeElemOff :: Ptr a -> Int -> a -> IO ()
-  -- peekByteOff :: Ptr b -> Int -> IO a
-  -- pokeByteOff :: Ptr b -> Int -> a -> IO ()
-  -- peek :: Ptr a -> IO a
-  -- poke :: Ptr a -> a -> IO ()
-  sizeOf = error "TODO : Storable String instance."
-  alignment = error "TODO : Storable String instance."
-  peekElemOff = error "TODO : Storable String instance."
-  pokeElemOff = error "TODO : Storable String instance."
-  peekByteOff = error "TODO : Storable String instance."
-  pokeByteOff = error "TODO : Storable String instance."
-  poke = error "TODO : Storable String instance."
+instance IsType CFloat where
+  typeDepiction _ = TDFloat
+
+instance IsType String where
+  typeDepiction _ = TDString
+
+typeof2 f = [typeDepiction ta, typeDepiction tb]
+  where (ta,tb) = typeof2' f
+        typeof2' :: (a->b) -> (a,b)
+        typeof2' = undefined
+
+typeof3 f = [typeDepiction ta, typeDepiction tb, typeDepiction tc]
+  where (ta,tb,tc) = typeof3' f
+        typeof3' :: (a->b->c) -> (a,b,c)
+        typeof3' = undefined
+
+sizeof TDInt   = sizeOf int
+sizeof TDFloat = sizeOf float
+
+alignmentof TDInt   = alignment int
+alignmentof TDFloat = alignment float
+
 
 ----------------------------------------------------------------------
 -- Node
@@ -94,11 +88,8 @@ instance Storable String where
 type Ref = Int
 
 -- A typed reference.
-data TRef a = TRef Ref
+newtype TRef a = TRef Ref
   deriving Show
-
-type RInt = TRef Int
-type RFloat = TRef Float
 
 type Rank = Int
 
@@ -160,14 +151,14 @@ setParents (Op t i p c r) p' = Op t i p' c r
 -- Graph
 ----------------------------------------------------------------------
 
-data G = G { nodes :: IM.IntMap Node, nextName :: Ref }
+data Heap = Heap { nodes :: IM.IntMap Node, nextName :: Ref }
   deriving Show
 
-type N a = State G (TRef a)
+type N a = State Heap (TRef a)
 
-emptyGraph = G IM.empty 0
+emptyGraph = Heap IM.empty 0
 
-graph :: State G a -> IM.IntMap Node
+graph :: State Heap a -> IM.IntMap Node
 graph = nodes . (flip execState emptyGraph)
 
 alist = IM.toList
@@ -205,13 +196,15 @@ dotOne2 (r,node) = concatMap (\c -> "n" ++ show r ++ " -> n" ++ show c ++ "\n") 
 dotRank2 = concatMap dotOne2
 dot2 = (concatMap dotRank2) . grouped
 
-doDot g = do
-  let g' = graph g
-  putStrLn "digraph G {"
-  putStr $ dot1 g'
-  putStrLn ""
-  putStr $ dot2 g'
-  putStrLn "}"
+doDot g = 
+  let g' = graph g in
+  "digraph G {"
+  ++ dot1 g'
+  ++ "\n"
+  ++ dot2 g'
+  ++ "}\n"
+
+writeDot fn g = writeFile fn (doDot g)
 
 ----------------------------------------------------------------------
 -- C
@@ -259,7 +252,7 @@ outs g = concatMap outOne funs
 
 cname' g r = cname (r,g IM.! r)
 
-doCode ::  State G a -> String
+doCode ::  State Heap a -> String
 doCode g = let g' = graph g in
   "#include <stdio.h>"
   ++" /* The loop can call the up_<input> and out_<output> functions. */\n"
@@ -303,18 +296,6 @@ ttcCode code = do
 -- Storable
 ----------------------------------------------------------------------
 
-class (Storable p, Typeable p) => Pointable p where
-  ptr :: Ptr p
-
-instance (Storable p, Typeable p) => Pointable p where
-  ptr = nullPtr
-
-mySizeOf TDInt   = sizeOf int
-mySizeOf TDFloat = sizeOf float
-
-myAlignment TDInt   = alignment int
-myAlignment TDFloat = alignment float
-
 data Memory = Memory Int (IM.IntMap Node)
   deriving Show
 
@@ -329,8 +310,8 @@ memoryAcc mem off x@(r,node) =
     then (sx + off,      (r,(off,     n')))
     else (sx + off + al, (r,(off + al,n')))
   where tx = typ $ snd x
-        sx = mySizeOf tx
-        ax = myAlignment tx
+        sx = sizeof tx
+        ax = alignmentof tx
         re = off `mod` ax -- how much is needed if any
         al = ax - re      -- padding to regain alignment if needed
         n  = setChildren node $ map (offset mem) (children node)
@@ -347,7 +328,7 @@ go (Memory size m) = do
 -- Graph
 ----------------------------------------------------------------------
 
-instance Show (State G a) where
+instance Show (State Heap a) where
   show g = show $ execState g emptyGraph
 
 instance Eq (N w) where
@@ -377,14 +358,14 @@ same g1 g2 (n1,n2) =
                          Op t2 i2 p2 _ _ -> t1 == t2 && i1 == i2 && length p1 == length p2 && and (map (same g1 g2) (zip p1 p2))
                          otherwise       -> False
 
-instance (Pointable n, Num n) => Num (N n) where
+instance (IsType n, Num n) => Num (N n) where
   (+) = lift2 (+) "+"
   (*) = lift2 (*) "*"
   signum = lift1 signum "signumf"
   abs = lift1 abs "abs"
   fromInteger = (constant undefined) . show
 
-instance (Pointable n, Fractional n) => Fractional (N n) where
+instance (IsType n, Fractional n) => Fractional (N n) where
   (/) = lift2 (/) "/"
   recip = lift1 recip "recip"
   fromRational = (constant undefined) . show . fromRational
@@ -397,7 +378,7 @@ addChild' c n@(Op t info ps cs rk) = if c `elem` cs then n else Op t info ps (c:
 mkNode n = do
   i <- gets nextName
   ns <- gets nodes
-  put $ G { nodes = IM.insert i n ns, nextName = i + 1 }
+  put $ Heap { nodes = IM.insert i n ns, nextName = i + 1 }
   return i
 
 -- Add c as a child to the node n.
@@ -406,11 +387,11 @@ addChild c n = do
   g <- get
   put $ g { nodes = IM.adjust (addChild' c) n ns }
 
-constant :: (Pointable a) => a -> String -> N a
-constant v info = mkNode (Cst (head $ typeDepiction v) info []) >>= return . TRef
+constant :: (IsType a) => a -> String -> N a
+constant v info = mkNode (Cst (typeDepiction v) info []) >>= return . TRef
 
-input :: (Pointable a) => a -> String -> N a
-input v info = mkNode (In (head $ typeDepiction v) info []) >>= return . TRef
+input :: (IsType a) => a -> String -> N a
+input v info = mkNode (In (typeDepiction v) info []) >>= return . TRef
 
 output info a = do
   TRef n1 <- a
@@ -433,20 +414,20 @@ multiOut info refs = do
   mapM_ (addChild n) refs
   return (TRef n)
 
-lift1 :: (Pointable a, Pointable b) => (a -> b) -> String -> (N a -> N b)
+lift1 :: (IsType a, IsType b) => (a -> b) -> String -> (N a -> N b)
 lift1 f name = \a -> do
   r1 <- a
   op1 f name r1
 
 -- test for similar subgraph (not every nodes are checked, just the two
 -- added nodes are tested against each other, but it works).
-lift2' :: (Pointable a, Pointable b, Pointable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
+lift2' :: (IsType a, IsType b, IsType c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
 lift2' f name = \a b ->
   if a `eq` b
    then do
     TRef n1 <- a
     rk1 <- gets (rank . (IM.! n1) . nodes)
-    n <- mkNode (Op (typeDepiction f) name [n1,n1] [] (rk1 + 1))
+    n <- mkNode (Op (typeof3 f) name [n1,n1] [] (rk1 + 1))
     addChild n n1
     return (TRef n)
    else do
@@ -454,24 +435,24 @@ lift2' f name = \a b ->
     r2 <- b
     op2 f name r1 r2
 -- no test
-lift2 :: (Pointable a, Pointable b, Pointable c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
+lift2 :: (IsType a, IsType b, IsType c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
 lift2 f name = \a b -> do
   r1 <- a
   r2 <- b
   op2 f name r1 r2
 
-op1 :: (Pointable a, Pointable b) => (a -> b) -> String -> TRef a -> N b
+op1 :: (IsType a, IsType b) => (a -> b) -> String -> TRef a -> N b
 op1 f name (TRef n1) = do
   rk1 <- gets (rank . (IM.! n1) . nodes)
-  n <- mkNode (Op (typeDepiction f) name [n1] [] (rk1 + 1))
+  n <- mkNode (Op (typeof2 f) name [n1] [] (rk1 + 1))
   addChild n n1
   return (TRef n)
 
-op2 :: (Pointable a, Pointable b, Pointable c) => (a -> b -> c) -> String -> TRef a -> TRef b -> N c
+op2 :: (IsType a, IsType b, IsType c) => (a -> b -> c) -> String -> TRef a -> TRef b -> N c
 op2 f name (TRef n1) (TRef n2) = do
   rk1 <- gets (rank . (IM.! n1) . nodes)
   rk2 <- gets (rank . (IM.! n2) . nodes)
-  n <- mkNode (Op (typeDepiction f) name [n1,n2] [] (max rk1 rk2 + 1))
+  n <- mkNode (Op (typeof3 f) name [n1,n2] [] (max rk1 rk2 + 1))
   addChild n n1
   addChild n n2
   return (TRef n)
@@ -516,4 +497,12 @@ ex4 = do
   m <- milliseconds
   a <- add m m
   out "console" a
+
+-- Like 'let', for sharing.
+with :: N a -> (N a -> N b) -> N b
+with x f = x >>= (f . return)
+
+-- sharing occurs !
+ex5 = with (milliseconds + 5) (\a -> output "console" $ a + a)
+
 
