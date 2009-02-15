@@ -19,10 +19,10 @@
 -- to the Float value (of type TypeRep) in the constructed
 -- node. Maybe I could use TH to generate some of this stuff.
 --
--- 'usage' : in ghci : doDot ex1
--- or : ghc Graph.hs -e 'putStrLn $ doDot ex1' | dot -Tsvg -oex1.svg
--- or : ghc -e "putStrLn $ doCode ex4" Graph.hs
--- or : ghc -e "ttcCode $ doCode ex4" Graph.hs
+-- 'usage' : in ghci : dotString ex1
+-- or : ghc Graph.hs -e 'putStrLn $ dotString ex1' | dot -Tsvg -oex1.svg
+-- or : ghc -e "putStrLn $ cCodeString ex4" Graph.hs
+-- or : ghc -e "ttcCode $ cCodeString ex4" Graph.hs
 --
 module Graph where
 
@@ -45,13 +45,28 @@ false = False
 int = undefined :: CInt
 float = undefined :: CFloat
 
+-- Types handled by the graph
 data TypeDepiction = TDInt
                    | TDFloat
                    | TDString
   deriving (Eq, Ord, Show)
 
-class IsType a where
+data InitialValue = IVInt CInt
+                  | IVFloat CFloat
+                  | IVString String
+                  | IVNone
+  deriving (Eq, Ord, Show)
+
+g :: CInt -> CInt -> CInt
+g = (+)
+g' a b = g (value a) (value b)
+
+class IsInitialValue a => IsType a where
   typeDepiction :: a -> TypeDepiction
+
+class IsInitialValue a where
+  initialValue :: a -> InitialValue
+  value :: InitialValue -> a
 
 instance IsType CInt where
   typeDepiction _ = TDInt
@@ -61,6 +76,21 @@ instance IsType CFloat where
 
 instance IsType String where
   typeDepiction _ = TDString
+
+instance IsInitialValue CInt where
+  initialValue a = IVInt a
+  value (IVInt a) = a
+  value a = error $ "Attempt to extract the value of " ++ show a ++ " as a CInt."
+
+instance IsInitialValue CFloat where
+  initialValue a = IVFloat a
+  value (IVFloat a) = a
+  value a = error $ "Attempt to extract the value of " ++ show a ++ " as a CFloat."
+
+instance IsInitialValue String where
+  initialValue a = IVString a
+  value (IVString a) = a
+  value a = error $ "Attempt to extract the value of " ++ show a ++ " as a String."
 
 typeof2 f = [typeDepiction ta, typeDepiction tb]
   where (ta,tb) = typeof2' f
@@ -99,56 +129,45 @@ type Rank = Int
 -- e.g. Op ([Int,Int],Int) "plus" [a,b] [c] means the node Plus depends
 -- on a and b (the parents) and c depends on it (c is a child of Plus).
 -- Furthermore the type of the parents should match with the one of the Op.
-data Node = Cst TypeDepiction String [Ref]              -- children 
-          | In  TypeDepiction String [Ref]              -- children
-          | Out               String [Ref] Rank         -- parents
-          | Op  [TypeDepiction] String [Ref] [Ref] Rank -- parents, children
+-- A child has a rank higher than its parents, but not for a Delay node.
+-- If a child of x is a delay, it is the delay of x.
+-- The initial value of x, if x depends on its own delay, should be given.
+--
+-- The update mechanism is as follow :
+-- if a node x should be updated (because one or more of its parents is/are
+-- updated), all the children (and sub-children) and x itself are updated
+-- according to their rank. In the children of x, it might be some delay
+-- nodes which are constructed with a lower rank than x, so they will be
+-- updated before x, using its value, before x itself is updated, possibly
+-- using its preceding value stored in the delay.
+--
+-- The depict has always one element, except for Op.
+-- The rank for Cst and In is always 0.
+-- The parents for Cst and In is always [].
+-- The children for Out is always [].
+-- The depict for Out is always [].
+-- A Delay has only one parent which has a *higher* rank.
+data NodeKind = Cst | In | Out | Op | Delay
+  deriving (Eq,Ord,Show)
+data Node =
+  Node {
+    kind     :: NodeKind
+  , initv    :: InitialValue
+  , depict   :: [TypeDepiction]
+  , info     :: String
+  , parents  :: [Ref]
+  , children :: [Ref]
+  , rank     :: Rank
+  }
   deriving Show
 
-isCst (Cst _ _ _) = True
-isCst _ = False
-isIn (In _ _ _) = True
-isIn _ = False
-isOut (Out _ _ _) = True
-isOut _ = False
-isOp (Op _ _ _ _ _) = True
-isOp _ = False
+isCst = (== Cst) . kind
+isIn  = (== In) . kind
+isOut = (== Out) . kind
+isOp  = (== Op) . kind
+isDelay  = (== Delay) . kind
 
-info (Cst _ i _) = i
-info (In _ i _) = i
-info (Out i _ _) = i
-info (Op _ i _ _ _) = i
-
-rank :: Node -> Rank
-rank (Cst _ _ _) = 0
-rank (In _ _ _) = 0
-rank (Out _ _ rk) = rk
-rank (Op _ _ _ _ rk) = rk
-
-parents (Cst _ _ _) = []
-parents (In _ _ _) = []
-parents (Out _ p _) = p
-parents (Op _ _ p _ _) = p
-
-children (Cst _ _ c) = c
-children (In _ _ c) = c
-children (Out _ _ _) = []
-children (Op _ _ _ c _) = c
-
-typ (Cst t _ _) = t
-typ (In t _ _) = t
-typ (Out _ _ _) = error "Attempt to get the type of an Out node."
-typ (Op ts _ _ _ _) = last ts
-
-setChildren (Cst t i c)    c' = Cst t i c'
-setChildren (In t i c)     c' = In t i c'
-setChildren (Out i p r)  _  = Out i p r
-setChildren (Op t i p c r) c' = Op t i p c' r
-
-setParents (Cst t i c)    _  = Cst t i c
-setParents (In t i c)     _  = In t i c
-setParents (Out i p r)  p' = Out i p' r
-setParents (Op t i p c r) p' = Op t i p' c r
+typ = last . depict
 
 ----------------------------------------------------------------------
 -- Graph
@@ -184,30 +203,35 @@ below g r = tail $ below' r
 ----------------------------------------------------------------------
 
 -- nodes
-dotOne1 (r,node) = "n" ++ show r ++ " [" ++
+dotOne1 g (r,node) = "n" ++ show r ++ " [" ++
   (concat $ intersperse ", " $ ["label=\"" ++ info node ++ "\""] ++ attr node)
   ++ "]\n"
-  where attr n | isCst n = ["color=grey"]
+  where attr n | isCst n = ["color=grey", "fontcolor=grey"]
                | isIn n = ["color=cyan"]
                | isOut n = ["color=orange"]
                | otherwise = []
-dotRank1 = concatMap dotOne1
-dot1 = (concatMap dotRank1) . grouped
+dotRank1 g = concatMap (dotOne1 g)
+dot1 g = concatMap (dotRank1 g) (grouped g)
 
 -- arcs
-dotOne2 (r,node) = concatMap (\c -> "n" ++ show r ++ " -> n" ++ show c ++ "\n") (children node)
-dotRank2 = concatMap dotOne2
-dot2 = (concatMap dotRank2) . grouped
+dotOne2 g (r,node) = concatMap (\c -> "n" ++ show r ++ " -> n" ++ show c ++ " [" ++
+  (concat $ intersperse ", " $ attr node c)
+  ++"]\n") (children node)
+  where attr n c | isCst n = ["color=grey"]
+                 | isDelay (g IM.! c) = ["style=dashed"]
+                 | otherwise = []
+dotRank2 g = concatMap (dotOne2 g)
+dot2 g = concatMap (dotRank2 g) (grouped g)
 
-doDot g = 
+dotString g = 
   let g' = graph g in
-  "digraph G {"
+  "digraph G {\n"
   ++ dot1 g'
   ++ "\n"
   ++ dot2 g'
   ++ "}\n"
 
-writeDot fn g = writeFile fn (doDot g)
+writeAsDot fn g = writeFile fn (dotString g)
 
 ----------------------------------------------------------------------
 -- C
@@ -217,10 +241,11 @@ vars g = map var (byrank g)
 var (r,node) | isOut node = ""
              | isCst node = (typeShow . typ) node ++ " " ++ cname (r,node) ++ " = " ++ info node ++ ";"
              | otherwise  = (typeShow . typ) node ++ " " ++ cname (r,node) ++ ";" ++ " /* " ++ info node ++ " */"
-cname (r,(Cst _ _ _)) = "cst" ++ show r
-cname (r,(In _ _ _)) = "inp" ++ show r
-cname (r,(Op _ _ _ _ _)) = "nod" ++ show r
-cname (r,(Out _ _ _)) = "out" ++ show r
+cname (r,n) | isCst n = "cst" ++ show r
+            | isIn  n = "inp" ++ show r
+            | isOp  n = "nod" ++ show r
+            | isOut n = "out" ++ show r
+            | isDelay n = "del" ++ show r
 
 ups1 g = map up1 inputs
   where inputs = takeWhile (isIn . snd) (byrank g)
@@ -239,26 +264,26 @@ upNode g (r,node) | isOut node = "" -- no data to update for an output node
                   | isIn  node = error "input node shouldn't be updated from here"
                   | isCst node = "" -- no update for a constant node
                   | isOp  node = upOp g (r,node)
-upOp g (r,node@(Op ts info ps cs rk)) = upOp' g (r,node)
-upOp' g (r,node@(Op ts info [a,b] _ _))
-  | ts == [TDInt, TDInt, TDInt] && info == "+" =
-    cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " + " ++ cname (b,g IM.! b) ++ ";\n"
-  | ts == [TDInt, TDInt, TDInt] && info == "-" =
-    cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " - " ++ cname (b,g IM.! b) ++ ";\n"
-  | otherwise =
-    info ++ " (" ++ cname (r,node) ++ ", " ++ cname (a,g IM.! a) ++ ", " ++ cname (b,g IM.! b) ++ ");\n"
+upOp g (r,node) =
+  case (depict node,info node,parents node) of
+    ([TDInt, TDInt, TDInt],"+",[a,b]) ->
+      cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " + " ++ cname (b,g IM.! b) ++ ";\n"
+    ([TDInt, TDInt, TDInt],"-",[a,b]) ->
+      cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " - " ++ cname (b,g IM.! b) ++ ";\n"
+    _ ->
+      info node ++ " (" ++ cname (r,node) ++ ", " ++ intercalate ", " (map (cname' g) (parents node)) ++ ");\n"
 
 outs g = concatMap outOne funs
   where outputs = filter (isOut . snd) (alist g)
         funs = map (info . snd) $ nubBy (\(_,node1) (_,node2) -> info node1 == info node2) outputs
         outOne name = "void out_" ++ name ++ " ()\n{\n" ++ body name ++ "\n}"
         body name = concatMap call $ filter ((== name) . info . snd) outputs
-        call (r,node) = info node ++ " (" ++ intercalate ", " (map (cname' g) (parents node)) ++ ");"
+        call (r,node) = info node ++ " (" ++ intercalate ", " (map (cname' g) (parents node)) ++ ");\n"
 
 cname' g r = cname (r,g IM.! r)
 
-doCode ::  State Heap a -> String
-doCode g = let g' = graph g in
+cCodeString ::  State Heap a -> String
+cCodeString g = let g' = graph g in
   "#include <stdio.h>"
   ++" /* The loop can call the up_<input> and out_<output> functions. */\n"
   ++ " /* The <output> functions should be provided.                   */\n"
@@ -319,8 +344,8 @@ memoryAcc mem off x@(r,node) =
         ax = alignmentof tx
         re = off `mod` ax -- how much is needed if any
         al = ax - re      -- padding to regain alignment if needed
-        n  = setChildren node $ map (offset mem) (children node)
-        n' = setParents n $ map (offset mem) (parents n)
+        n  = node { children = map (offset mem) (children node) }
+        n' = n { parents = map (offset mem) (parents n) }
 
 -- translate from the map-ref (or alist-ref) to the memory-ref.
 offset mem r = fst . fromJust $ lookup r mem
@@ -348,20 +373,14 @@ eq a b = same g1 g2 (n1,n2)
     (TRef n1, nodes -> g1) = runState a emptyGraph
     (TRef n2, nodes -> g2) = runState b emptyGraph
 
-same g1 g2 (n1,n2) =
-  case (g1 IM.! n1) of
-    Cst t1 i1 _     -> case (g2 IM.! n2) of
-                         Cst t2 i2 _ -> t1 == t2 && i1 == i2
-                         otherwise   -> False
-    In t1 i1 _      -> case (g2 IM.! n2) of
-                         In t2 i2 _ -> t1 == t2 && i1 == i2
-                         otherwise   -> False
-    Out i1 p1 _  -> case (g2 IM.! n2) of
-                         Out i2 p2 _ -> i1 == i2 && length p1 == length p2 && and (map (same g1 g2) (zip p1 p2))
-                         otherwise   -> False
-    Op t1 i1 p1 _ _ -> case (g2 IM.! n2) of
-                         Op t2 i2 p2 _ _ -> t1 == t2 && i1 == i2 && length p1 == length p2 && and (map (same g1 g2) (zip p1 p2))
-                         otherwise       -> False
+same g1 g2 (r1,r2) =
+  let (n1,n2) = (g1 IM.! r1,g2 IM.! r2) in
+  kind n1 == kind n2 &&
+  initv n1 == initv n2 &&
+  depict n1 == depict n2 &&
+  info n1 == info n2 &&
+  length (parents n1) == length (parents n2) &&
+  (and $ map (same g1 g2) (zip (parents n1) (parents n2)))
 
 instance (IsType n, Num n) => Num (N n) where
   (+) = lift2 (+) "+"
@@ -370,16 +389,16 @@ instance (IsType n, Num n) => Num (N n) where
   negate = lift1 negate "negate"
   abs = lift1 abs "abs"
   signum = lift1 signum "signumf"
-  fromInteger = (constant undefined) . show
+  fromInteger n = constant (fromInteger n) (show n)
 
 instance (IsType n, Fractional n) => Fractional (N n) where
   (/) = lift2 (/) "/"
   recip = lift1 recip "recip"
-  fromRational = (constant undefined) . show . fromRational
+  fromRational n = constant (fromRational n) (show $ fromRational n)
 
-addChild' c n@(Cst t info cs) = if c `elem` cs then n else Cst t info (c:cs)
-addChild' c n@(In t info cs) = if c `elem` cs then n else In t info (c:cs)
-addChild' c n@(Op t info ps cs rk) = if c `elem` cs then n else Op t info ps (c:cs) rk
+addChild' c n = if c `elem` children n then n else n { children = c : children n }
+
+addParent' p n = if p `elem` parents n then n else n { parents = p : parents n }
 
 -- Create a node (and give it automatically a name).
 mkNode n = do
@@ -390,26 +409,30 @@ mkNode n = do
 
 -- Add c as a child to the node n.
 addChild c n = do
-  ns <- gets nodes
-  g <- get
-  put $ g { nodes = IM.adjust (addChild' c) n ns }
+  change n (addChild' c)
+
+addParent p n = do
+  change n (addParent' p)
+
+change n f = do
+  modify (\g -> g { nodes = IM.adjust f n (nodes g) })
 
 constant :: (IsType a) => a -> String -> N a
-constant v info = mkNode (Cst (typeDepiction v) info []) >>= return . TRef
+constant v info = mkNode (Node Cst (initialValue v) [(typeDepiction v)] info [] [] 0) >>= return . TRef
 
 input :: (IsType a) => a -> String -> N a
-input v info = mkNode (In (typeDepiction v) info []) >>= return . TRef
+input v info = mkNode (Node In (initialValue v) [(typeDepiction v)] info [] [] 0) >>= return . TRef
 
 output info a = do
   TRef n1 <- a
   node <- gets ((IM.! n1) . nodes)
-  n <- mkNode (Out info [n1] (rank node + 1))
+  n <- mkNode (Node Out IVNone [] info [n1] [] (rank node + 1))
   addChild n n1
   return (TRef n)
 
 out info (TRef n1) = do
-  rk <- gets (rank . (IM.! n1) . nodes)
-  n <- mkNode (Out info [n1] (rk + 1))
+  node <- gets ((IM.! n1) . nodes)
+  n <- mkNode (Node Out IVNone [] info [n1] [] (rank node + 1))
   addChild n n1
   return ()
 
@@ -417,7 +440,7 @@ out info (TRef n1) = do
 multiOut info refs = do
   ns <- gets nodes
   let rk = maximum $ map (rank . (ns IM.!)) refs
-  n <- mkNode (Out info refs (rk + 1))
+  n <- mkNode (Node Out IVNone [] info refs [] (rk + 1))
   mapM_ (addChild n) refs
   return (TRef n)
 
@@ -428,13 +451,15 @@ lift1 f name = \a -> do
 
 -- test for similar subgraph (not every nodes are checked, just the two
 -- added nodes are tested against each other, but it works).
+-- The test should be done in the mkNode function.
 lift2' :: (IsType a, IsType b, IsType c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
 lift2' f name = \a b ->
   if a `eq` b
    then do
     TRef n1 <- a
     rk1 <- gets (rank . (IM.! n1) . nodes)
-    n <- mkNode (Op (typeof3 f) name [n1,n1] [] (rk1 + 1))
+    iv1 <- gets (initv . (IM.! n1) . nodes)
+    n <- mkNode (Node Op (initialValue $ f (value iv1) (value iv1)) (typeof3 f) name [n1,n1] [] (rk1 + 1))
     addChild n n1
     return (TRef n)
    else do
@@ -451,7 +476,8 @@ lift2 f name = \a b -> do
 op1 :: (IsType a, IsType b) => (a -> b) -> String -> TRef a -> N b
 op1 f name (TRef n1) = do
   rk1 <- gets (rank . (IM.! n1) . nodes)
-  n <- mkNode (Op (typeof2 f) name [n1] [] (rk1 + 1))
+  iv1 <- gets (initv . (IM.! n1) . nodes)
+  n <- mkNode (Node Op (initialValue $ f $ value iv1) (typeof2 f) name [n1] [] (rk1 + 1))
   addChild n n1
   return (TRef n)
 
@@ -459,13 +485,26 @@ op2 :: (IsType a, IsType b, IsType c) => (a -> b -> c) -> String -> TRef a -> TR
 op2 f name (TRef n1) (TRef n2) = do
   rk1 <- gets (rank . (IM.! n1) . nodes)
   rk2 <- gets (rank . (IM.! n2) . nodes)
-  n <- mkNode (Op (typeof3 f) name [n1,n2] [] (max rk1 rk2 + 1))
+  iv1 <- gets (initv . (IM.! n1) . nodes)
+  iv2 <- gets (initv . (IM.! n2) . nodes)
+  n <- mkNode (Node Op (initialValue $ f (value iv1) (value iv2)) (typeof3 f) name [n1,n2] [] (max rk1 rk2 + 1))
   addChild n n1
   addChild n n2
   return (TRef n)
 
 add :: TRef CInt -> TRef CInt -> N CInt
 add = op2 (+) "+"
+
+withDelay :: (IsType a) => a -> (N a -> N a) -> (N a)
+withDelay v f = do
+  d <- mkNode (Node Delay (initialValue v) [(typeDepiction v)] "delay" [] [] 0)
+  (TRef x) <- share (return $ TRef d) f
+  addChild x d
+  addChild d x
+  addParent x d
+  rk1 <- gets (rank . (IM.! x) . nodes)
+  change d (\d -> d { rank = pred rk1 })
+  return (TRef x)
 
 ----------------------------------------------------------------------
 -- Examples
@@ -475,14 +514,14 @@ foo = lift2 f "foo"
 f :: CInt -> CFloat -> String
 f x s = "hello"
 
-milliseconds = input int "milliseconds"
+milliseconds = input (0::CInt) "milliseconds"
 
 ex1 = output "hey" $ (milliseconds + 45) `foo` (55.6 * 1.2)
 
 ex1' = execState ex1 emptyGraph
 
 -- The main problem of this approch is showed
--- by doDot ex2 : the subgraph constructed by a
+-- by dotString ex2 : the subgraph constructed by a
 -- is not shared. (It's just like a is a little
 -- program that is run twice by the + combinator.)
 -- If it was a real little language, a would be a
@@ -495,12 +534,9 @@ ex1' = execState ex1 emptyGraph
 -- node even if they were not initially shared.
 ex2 = output "yah" $ a - a
   where a = (milliseconds + 12 + 46)
-(+++) = lift2' (+) "+check"
-ex3 = output "yah-shared" $ a +++ a
-  where a = (milliseconds + 12 + 46)
 
 -- no problem to discover sharing here but more ugly syntax.
-ex4 = do
+ex3 = do
   m <- milliseconds
   a <- add m m
   out "console" a
@@ -510,6 +546,9 @@ share :: N a -> (N a -> N b) -> N b
 share x f = x >>= (f . return)
 
 -- sharing occures !
-ex5 = share (milliseconds + 5) (\a -> output "console" $ a + a - 2)
+ex4 = share (milliseconds + 5) (\a -> output "console" $ a + a - 2)
+
+-- delay
+ex5 = output "console" $ withDelay 0 (\d -> d + (8::N CInt))
 
 
