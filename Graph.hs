@@ -1,6 +1,6 @@
 {-# LANGUAGE ViewPatterns, FlexibleInstances, TypeSynonymInstances, NoMonomorphismRestriction, ExistentialQuantification, UndecidableInstances #-}
 -- 2009.01.08
--- 2009.02.09
+-- 2009.02.15
 -- Vo Minh Thu
 --
 -- The graph is made of nodes named/referenced by Int's.
@@ -49,11 +49,13 @@ float = undefined :: CFloat
 data TypeDepiction = TDInt
                    | TDFloat
                    | TDString
+                   | TDVoid
   deriving (Eq, Ord, Show)
 
 data InitialValue = IVInt CInt
                   | IVFloat CFloat
                   | IVString String
+                  | IVVoid
                   | IVNone
   deriving (Eq, Ord, Show)
 
@@ -77,6 +79,9 @@ instance IsType CFloat where
 instance IsType String where
   typeDepiction _ = TDString
 
+instance IsType () where
+  typeDepiction _ = TDVoid
+
 instance IsInitialValue CInt where
   initialValue a = IVInt a
   value (IVInt a) = a
@@ -91,6 +96,11 @@ instance IsInitialValue String where
   initialValue a = IVString a
   value (IVString a) = a
   value a = error $ "Attempt to extract the value of " ++ show a ++ " as a String."
+
+instance IsInitialValue () where
+  initialValue a = IVVoid
+  value IVVoid = ()
+  value a = error $ "Attempt to extract the value of " ++ show a ++ " as ()."
 
 typeof2 f = [typeDepiction ta, typeDepiction tb]
   where (ta,tb) = typeof2' f
@@ -110,6 +120,7 @@ alignmentof TDFloat = alignment float
 
 typeShow TDInt   = "int"
 typeShow TDFloat = "float"
+typeShow TDVoid = "void"
 
 
 ----------------------------------------------------------------------
@@ -141,6 +152,11 @@ type Rank = Int
 -- updated before x, using its value, before x itself is updated, possibly
 -- using its preceding value stored in the delay.
 --
+-- TODO : There are two different Nodes : Signal and Event. When a signal
+-- is updated, the update is propagated only if its value change. When
+-- an event is updated (or just occurs if it has no value), the update
+-- is always propagated.
+--
 -- The depict has always one element, except for Op.
 -- The rank for Cst and In is always 0.
 -- The parents for Cst and In is always [].
@@ -157,6 +173,7 @@ data Node =
   , info     :: String
   , parents  :: [Ref]
   , children :: [Ref]
+  , ignored  :: [Ref] -- parent nodes whose updates are ignored.
   , rank     :: Rank
   }
   deriving Show
@@ -169,6 +186,12 @@ isDelay  = (== Delay) . kind
 
 typ = last . depict
 
+-- predicate to know if a node cnode has a parent's
+-- reference pref but ignores it : the child is not
+-- updated because of that parent.
+cnode `ignores` pref = pref `elem` (ignored cnode)
+
+
 ----------------------------------------------------------------------
 -- Graph
 ----------------------------------------------------------------------
@@ -180,8 +203,9 @@ type N a = State Heap (TRef a)
 
 emptyGraph = Heap IM.empty 0
 
-graph :: State Heap a -> IM.IntMap Node
-graph = nodes . (flip execState emptyGraph)
+graph gs = nodes (execState (go gs) emptyGraph)
+  where go [] = return ()
+        go (g:gs) = g >> go gs
 
 alist = IM.toList
 
@@ -239,6 +263,8 @@ writeAsDot fn g = writeFile fn (dotString g)
 
 vars g = map var (byrank g)
 var (r,node) | isOut node = ""
+             | isIn node && typ node == TDVoid = " /* " ++ info node ++ " */"
+             | isOp node && info node == "quit_on" = " /* " ++ info node ++ " */"
              | isCst node = (typeShow . typ) node ++ " " ++ cname (r,node) ++ " = " ++ info node ++ ";"
              | otherwise  = (typeShow . typ) node ++ " " ++ cname (r,node) ++ ";" ++ " /* " ++ info node ++ " */"
 cname (r,n) | isCst n = "cst" ++ show r
@@ -248,15 +274,19 @@ cname (r,n) | isCst n = "cst" ++ show r
             | isDelay n = "del" ++ show r
 
 ups1 g = map up1 inputs
-  where inputs = takeWhile (isIn . snd) (byrank g)
-up1 (r,node) = "void up" ++ show r ++ " ();\n"
+  where inputs = filter (isIn . snd) (byrank g)
+up1 (r,node) | typ node == TDVoid = "void up" ++ show r ++ " ();\n"
+  ++ "void up_" ++ info node ++ " ()\n{\n"
+  ++ "up" ++ show r ++ " ();\n"
+  ++ "}\n"
+             | otherwise = "void up" ++ show r ++ " ();\n"
   ++ "void up_" ++ info node ++ " (" ++ (typeShow . typ) node ++ " x" ++ ")\n{\n"
   ++ cname (r,node) ++ " = x;\n"
   ++ "up" ++ show r ++ " ();\n"
   ++ "}\n"
 
 ups2 g = map (up2 g) inputs
-  where inputs = takeWhile (isIn . snd) (byrank g)
+  where inputs = filter (isIn . snd) (byrank g)
 up2 g (r,node) = "void up" ++ show r ++ " ()\n{\n" ++ body (r,node) g ++ "\n}"
 body (r,node) g = concatMap (upNode g) depends
   where depends = sortByRank $ below g r
@@ -270,6 +300,10 @@ upOp g (r,node) =
       cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " + " ++ cname (b,g IM.! b) ++ ";\n"
     ([TDInt, TDInt, TDInt],"-",[a,b]) ->
       cname (r,node) ++ " = " ++ cname (a,g IM.! a) ++ " - " ++ cname (b,g IM.! b) ++ ";\n"
+    ([TDInt],"count",_) ->
+      cname (r,node) ++ " ++;\n"
+    ([TDVoid],"quit_on",_) ->
+      "quit_loop = 1;\n"
     _ ->
       info node ++ " (" ++ cname (r,node) ++ ", " ++ intercalate ", " (map (cname' g) (parents node)) ++ ");\n"
 
@@ -282,11 +316,12 @@ outs g = concatMap outOne funs
 
 cname' g r = cname (r,g IM.! r)
 
-cCodeString ::  State Heap a -> String
+cCodeString ::  [State Heap a] -> String
 cCodeString g = let g' = graph g in
-  "#include <stdio.h>"
+  "#include <stdio.h>\n"
   ++" /* The loop can call the up_<input> and out_<output> functions. */\n"
   ++ " /* The <output> functions should be provided.                   */\n"
+  ++ "int quit_loop;\n"
   ++ "void console (int i) { printf (\"%d\\n\", i); }\n"
   ++ (unlines $ vars g')
   ++ (unlines $ ups1 g')
@@ -298,16 +333,20 @@ cCodeString g = let g' = graph g in
   ++ "  up_milliseconds (100);\n"
   ++ "  up_milliseconds (200);\n"
   ++ "  out_console ();\n"
+  ++ "  up_press_space ();\n"
+  ++ "  up_press_space ();\n"
   ++ "  up_milliseconds (300);\n"
   ++ "  up_milliseconds (400);\n"
   ++ "  out_console ();\n"
   ++ "  up_milliseconds (500);\n"
   ++ "  up_milliseconds (600);\n"
   ++ "  out_console ();\n"
+  ++ "  up_press_escape ();\n"
   ++ "}\n"
   ++ "int main ()\n"
   ++ "{\n"
-  ++ "  loop ();\n"
+  ++ "  quit_loop = 0;\n"
+  ++ "  while (!quit_loop) { loop (); }\n"
   ++ "  return 0;\n"
   ++ "}\n"
 
@@ -418,55 +457,29 @@ change n f = do
   modify (\g -> g { nodes = IM.adjust f n (nodes g) })
 
 constant :: (IsType a) => a -> String -> N a
-constant v info = mkNode (Node Cst (initialValue v) [(typeDepiction v)] info [] [] 0) >>= return . TRef
+constant v info = mkNode (Node Cst (initialValue v) [(typeDepiction v)] info [] [] [] 0) >>= return . TRef
 
 input :: (IsType a) => a -> String -> N a
-input v info = mkNode (Node In (initialValue v) [(typeDepiction v)] info [] [] 0) >>= return . TRef
+input v info = mkNode (Node In (initialValue v) [(typeDepiction v)] info [] [] [] 0) >>= return . TRef
 
 output info a = do
   TRef n1 <- a
   node <- gets ((IM.! n1) . nodes)
-  n <- mkNode (Node Out IVNone [] info [n1] [] (rank node + 1))
+  n <- mkNode (Node Out IVNone [] info [n1] [] [] (rank node + 1))
   addChild n n1
   return (TRef n)
 
 out info (TRef n1) = do
   node <- gets ((IM.! n1) . nodes)
-  n <- mkNode (Node Out IVNone [] info [n1] [] (rank node + 1))
+  n <- mkNode (Node Out IVNone [] info [n1] [] [] (rank node + 1))
   addChild n n1
   return ()
-
--- works on Ref's, not on TRef's.
-multiOut info refs = do
-  ns <- gets nodes
-  let rk = maximum $ map (rank . (ns IM.!)) refs
-  n <- mkNode (Node Out IVNone [] info refs [] (rk + 1))
-  mapM_ (addChild n) refs
-  return (TRef n)
 
 lift1 :: (IsType a, IsType b) => (a -> b) -> String -> (N a -> N b)
 lift1 f name = \a -> do
   r1 <- a
   op1 f name r1
 
--- test for similar subgraph (not every nodes are checked, just the two
--- added nodes are tested against each other, but it works).
--- The test should be done in the mkNode function.
-lift2' :: (IsType a, IsType b, IsType c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
-lift2' f name = \a b ->
-  if a `eq` b
-   then do
-    TRef n1 <- a
-    rk1 <- gets (rank . (IM.! n1) . nodes)
-    iv1 <- gets (initv . (IM.! n1) . nodes)
-    n <- mkNode (Node Op (initialValue $ f (value iv1) (value iv1)) (typeof3 f) name [n1,n1] [] (rk1 + 1))
-    addChild n n1
-    return (TRef n)
-   else do
-    r1 <- a
-    r2 <- b
-    op2 f name r1 r2
--- no test
 lift2 :: (IsType a, IsType b, IsType c) => (a -> b -> c) -> String -> (N a -> N b -> N c)
 lift2 f name = \a b -> do
   r1 <- a
@@ -477,7 +490,7 @@ op1 :: (IsType a, IsType b) => (a -> b) -> String -> TRef a -> N b
 op1 f name (TRef n1) = do
   rk1 <- gets (rank . (IM.! n1) . nodes)
   iv1 <- gets (initv . (IM.! n1) . nodes)
-  n <- mkNode (Node Op (initialValue $ f $ value iv1) (typeof2 f) name [n1] [] (rk1 + 1))
+  n <- mkNode (Node Op (initialValue $ f $ value iv1) (typeof2 f) name [n1] [] [] (rk1 + 1))
   addChild n n1
   return (TRef n)
 
@@ -487,7 +500,7 @@ op2 f name (TRef n1) (TRef n2) = do
   rk2 <- gets (rank . (IM.! n2) . nodes)
   iv1 <- gets (initv . (IM.! n1) . nodes)
   iv2 <- gets (initv . (IM.! n2) . nodes)
-  n <- mkNode (Node Op (initialValue $ f (value iv1) (value iv2)) (typeof3 f) name [n1,n2] [] (max rk1 rk2 + 1))
+  n <- mkNode (Node Op (initialValue $ f (value iv1) (value iv2)) (typeof3 f) name [n1,n2] [] [] (max rk1 rk2 + 1))
   addChild n n1
   addChild n n2
   return (TRef n)
@@ -495,9 +508,10 @@ op2 f name (TRef n1) (TRef n2) = do
 add :: TRef CInt -> TRef CInt -> N CInt
 add = op2 (+) "+"
 
+-- not useful at the moment : no way for the result to be triggered.
 withDelay :: (IsType a) => a -> (N a -> N a) -> (N a)
 withDelay v f = do
-  d <- mkNode (Node Delay (initialValue v) [(typeDepiction v)] "delay" [] [] 0)
+  d <- mkNode (Node Delay (initialValue v) [(typeDepiction v)] "delay" [] [] [] 0)
   (TRef x) <- share (return $ TRef d) f
   addChild x d
   addChild d x
@@ -505,6 +519,23 @@ withDelay v f = do
   rk1 <- gets (rank . (IM.! x) . nodes)
   change d (\d -> d { rank = pred rk1 })
   return (TRef x)
+
+count :: (IsType a) => CInt -> N a -> N CInt
+count init event = do
+  TRef e <- event
+  rk <- gets (rank . (IM.! e) . nodes)
+  n <- mkNode (Node Op (initialValue init) [TDInt] "count" [e] [] [] (rk + 1))
+  addChild n e
+  return (TRef n)
+
+quit_on :: (IsType a) => N a -> N CInt
+quit_on event = do
+  TRef e <- event
+  rk <- gets (rank . (IM.! e) . nodes)
+  n <- mkNode (Node Op IVNone [TDVoid] "quit_on" [e] [] [] (rk + 1))
+  addChild n e
+  return (TRef n)
+
 
 ----------------------------------------------------------------------
 -- Examples
@@ -515,10 +546,10 @@ f :: CInt -> CFloat -> String
 f x s = "hello"
 
 milliseconds = input (0::CInt) "milliseconds"
+press_escape = input () "press_escape"
+press_space = input () "press_space"
 
-ex1 = output "hey" $ (milliseconds + 45) `foo` (55.6 * 1.2)
-
-ex1' = execState ex1 emptyGraph
+ex1 = [output "hey" $ (milliseconds + 45) `foo` (55.6 * 1.2)]
 
 -- The main problem of this approch is showed
 -- by dotString ex2 : the subgraph constructed by a
@@ -532,23 +563,30 @@ ex1' = execState ex1 emptyGraph
 -- is checked against every existing node. Maybe it
 -- would be expensive but it could find redondant
 -- node even if they were not initially shared.
-ex2 = output "yah" $ a - a
+ex2 = [output "yah" $ a - a]
   where a = (milliseconds + 12 + 46)
 
 -- no problem to discover sharing here but more ugly syntax.
-ex3 = do
+ex3 = [do
   m <- milliseconds
   a <- add m m
   out "console" a
+  ]
 
 -- Better solution (thanks to Oleg Kiselyov) : like 'let', for sharing.
 share :: N a -> (N a -> N b) -> N b
 share x f = x >>= (f . return)
 
 -- sharing occures !
-ex4 = share (milliseconds + 5) (\a -> output "console" $ a + a - 2)
+ex4 = [share (milliseconds + 5) (\a -> output "console" $ a + a - 2)]
 
--- delay
-ex5 = output "console" $ withDelay 0 (\d -> d + (8::N CInt))
+-- delay, but no way to update the value : it is never triggered.
+ex5 = [output "console" $ withDelay 0 (\d -> d + (8::N CInt))]
+
+ex_count = [
+    output "console" $ count 0 press_space
+  , output "console" $ (milliseconds + 5)
+  , quit_on press_escape
+  ]
 
 
