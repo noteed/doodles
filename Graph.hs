@@ -520,13 +520,15 @@ withDelay v f = do
   change d (\d -> d { rank = pred rk1 })
   return (TRef x)
 
-count :: (IsType a) => CInt -> N a -> N CInt
-count init event = do
-  TRef e <- event
-  rk <- gets (rank . (IM.! e) . nodes)
-  n <- mkNode (Node Op (initialValue init) [TDInt] "count" [e] [] [] (rk + 1))
-  addChild n e
+mkOp1 name init td n1 = do
+  TRef r1 <- n1
+  rk1 <- gets (rank . (IM.! r1) . nodes)
+  n <- mkNode (Node Op (initialValue init) [TDInt] "name" [r1] [] [] (rk1 + 1))
+  addChild n r1
   return (TRef n)
+
+count :: (IsType a) => CInt -> N a -> N CInt
+count init event = mkOp1 "count" init [TDInt] event
 
 quit_on :: (IsType a) => N a -> N CInt
 quit_on event = do
