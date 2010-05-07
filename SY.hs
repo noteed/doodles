@@ -9,7 +9,7 @@
 
 module SY where
 
-import Prelude
+import Data.List
 
 data Tree = Node [Tree]
 -- The to-be-shunted tokens. Only the information for the
@@ -116,32 +116,40 @@ shunt sh =
   S   (t@(Sym _):ts)    (s@(L "⟨"):ss)      (os:oss)                _ ->
     S ts                (s:ss)              ((t:os):oss)            SExpr
 
-  S   (t@(Sym x):ts)    (s@(Sym _):ss)      (os:h:oss) _ ->
-    case findOp x someTable of
-      [] -> S ts        (s:ss)              ((t:os):h:oss)          Application
-      _ ->  S (t:ts)    ss                  ((ap:h):oss)            FlushApp
-    where ap = if null os then s else Node (s : reverse os)
+  S   (t@(Node _):ts)   (s@(L "⟨"):ss)      (os:oss)                _ ->
+    S ts                (s:ss)              ((t:os):oss)            SExpr
 
-  S   (t@(Sym x):ts) (s@(Op [y]):ss) ((b:a:os):oss)      _ ->
-    case (findOp x someTable, findOp y someTable) of
-      ([], _) -> S ts   (t:s:ss)            ([]:(b:a:os):oss)             StackApp
+  S   (t@(Sym x):ts)    (s@(Sym _):ss)      (os:oss) _ ->
+    case findOp x someTable of
+      [] -> S ts        (s:ss)              ((t:os):oss)          Application
+      _ ->  S (t:ts)    ss                  (apply s $ os:oss)            FlushApp
+
+  S   (t@(Node _):ts)   (s@(Sym _):ss)      (os:oss)                _ ->
+    S ts                (s:ss)              ((t:os):oss)            Application
+
+  S   (t@(Sym x):ts) (s@(Op y):ss) oss      _ ->
+    case (findOp x someTable, findOps y someTable) of
+      ([], _) -> S ts   (t:s:ss)            ([]:oss)             StackApp
       ([o1@(In [_] [] _ _)], [o2@(In [_] [] _ _)])
         | assoc o1 || (lAssoc o1 && prec o1 <= prec o2) || (rAssoc o1 && prec o1 < prec o2) ->
-          S ts      (Op [x]:ss)           ((Node [s,a,b]:os):oss) StackOp
+          S ts      (Op [x]:ss)           (apply s oss) StackOp
         | otherwise ->
-          S ts      (Op [x]:s:ss)         ((b:a:os):oss)          StackOp
+          S ts      (Op [x]:s:ss)         oss          StackOp
+      ([o1@(In l1 r1 _ _)], [o2@(In l2 (r2:r2s) _ _)])
+        | l2++[r2] == l1 ->
+          S ts      (Op l1:ss)            oss          StackOp
+      _ -> error $ "TODO: " ++ show t ++ ", " ++ show s
 
-      _ | t `lower` s -> -- TODO this is wrong: every op 'not lower'
-                         -- than t should be popped, not just s.
-          S ts      (t:ss)              ((Node [s,a,b]:os):oss) StackOp
-      _ | otherwise ->
-          S ts      (t:s:ss)            ((b:a:os):oss)          StackOp
+  S   (t@(Node _):ts) (s@(Op _):ss)       oss                  _ ->
+    S ts              (t:s:ss)            ([]:oss)             StackApp
 
-  S   (t@(Sym x):ts) (s@(Node _):ss)   (os:h:oss)              _ ->
+  S   (t@(Sym x):ts) (s@(Node _):ss)   (os:oss)              _ ->
     case findOp x someTable of
-      [] -> S ts        (s:ss)              ((t:os):h:oss)          Application
-      _ -> S (t:ts)     ss                  ((ap:h):oss)            FlushApp
-    where ap = if null os then s else Node (s : reverse os)
+      [] -> S ts        (s:ss)              ((t:os):oss)          Application
+      _ -> S (t:ts)     ss                  (apply s $ os:oss)            FlushApp
+
+  S   (t@(Node _):ts) (s@(Node _):ss)       (os:oss)              _ ->
+    S ts              (s:ss)                ((t:os):oss)          Application
 
   S   (t@(Sym x):ts)    ss                  (os:oss)                _ ->
     case findOp x someTable of
@@ -150,6 +158,9 @@ shunt sh =
       _ -> case findOp1 x someTable of
         [] -> error "using middle sub-op as first sub-op"
         _ -> S ts      (Op [x]:ss)  (os:oss)  StackOp
+
+  S   (t@(Node _):ts)    ss                  (os:oss)                _ ->
+    S ts                 (t:ss)              ([]:os:oss)             StackApp
 
   S   (t@(L "⟨"):ts)    ss                  (os:oss)                _ ->
     S ts                (t:ss)              ([]:os:oss)             StackApp
@@ -168,7 +179,7 @@ shunt sh =
     S []                (s:ss)              oss                     UnmatchedL
 
   S   (t@(R _):ts)      (s@(L _):ss)        ((o:os):oss)            _ ->
-    S ts                (o':ss)             ([]:os:oss)             MatchedR
+    S (o':ts)           ss             (os:oss)             MatchedR
     where -- keep parenthesis around : (1 + ((a))) will be (+ 1 ((a))), not (+ 1 a).
           -- o' = case o of { Node [_] -> Node [o] ; Node _ -> o ; _ -> Node [o] }
           -- o' = case o of { Node [_] -> Node [o] ; Node _ -> Node [o] ; _ -> Node [o] }
@@ -177,27 +188,23 @@ shunt sh =
   S   (t@(R _):ts)      []                  (os:oss)                _ ->
     S (t:ts)            []                  (os:oss)                UnmatchedR
 
-  S   (t@(R _):ts)      (s@(Op _):ss) ((b:a:os):oss)          _ ->
-    S (t:ts)            ss                  ((Node [s,a,b]:os):oss) FlushOp
+  S   (t@(R _):ts)      (s@(Op _):ss)       oss          _ ->
+    S (t:ts)            ss                  (apply s oss) FlushOp
 
-  S   (t@(R _):ts)      (s@(Sym _):ss)      (os:h:oss)              _ ->
-    S (t:ts)            ss                  ((ap:h):oss)            FlushApp
-    where ap = if null os then s else Node (s : reverse os)
+  S   (t@(R _):ts)      (s@(Sym _):ss)      oss              _ ->
+    S (t:ts)            ss                  (apply s oss)            FlushApp
 
-  S   (t@(R _):ts)      (s@(Node _):ss)     (os:h:oss)              _ ->
-    S (t:ts)            ss                  ((ap:h):oss)            FlushApp
-    where ap = if null os then s else Node (s : reverse os)
+  S   (t@(R _):ts)      (s@(Node _):ss)     oss              _ ->
+    S (t:ts)            ss                  (apply s oss)            FlushApp
 
-  S   []                (s@(Op _):ss) ((b:a:os):oss)          _ ->
-    S []                ss                  ((Node [s,a,b]:os):oss) FlushOp
+  S   []                (s@(Op _):ss) oss          _ ->
+    S []                ss                  (apply s oss) FlushOp
 
-  S   []                (s@(Sym _):ss)      (os:h:oss) _ ->
-    S []                ss                  ((ap:h):oss)            FlushApp
-    where ap = if null os then s else Node (s : reverse os)
+  S   []                (s@(Sym _):ss)      oss _ ->
+    S []                ss                  (apply s oss)            FlushApp
 
-  S   []                (s@(Node _):ss)     (os:h: oss)             _ ->
-    S []                ss                  ((ap:h):oss)            FlushApp
-    where ap = if null os then s else Node (s : reverse os)
+  S   []                (s@(Node _):ss)     oss             _ ->
+    S []                ss                  (apply s oss)            FlushApp
 
   S   []                []                  [[o]]                   _ ->
     S []                []                  [[o]]                   Success
@@ -252,14 +259,27 @@ findOp op (In [] parts a p:xs)
      in In l r a p : findOp op xs
   | otherwise = findOp op xs
 
+-- TODO this is a special case of findOps
 findOp1 op [] = []
 findOp1 op (In [] parts a p:xs)
   | op == head parts = In [op] (tail parts) a p : findOp1 op xs
   | otherwise = findOp1 op xs
 
+findOps ops [] = []
+findOps ops (In [] parts a p:xs)
+  | ops `isPrefixOf` parts = In ops (drop (length ops) parts) a p : findOps ops xs
+  | otherwise = findOps ops xs
+
 break' p ls = case break p ls of
   (_, []) -> error "break': no element in l satisfying p"
   (l, r) -> (l ++ [head r], tail r)
+
+apply s@(Op y) (os:oss) = (Node (s:reverse l) : r) : oss
+  where (l,r) = splitAt (length y + 1) os -- TODO test correct lenght of os
+apply s@(Sym _) (os:h:oss) =  (ap:h):oss
+  where ap = if null os then s else Node (s:reverse os)
+apply s@(Node _) (os:h:oss) =  (ap:h):oss
+  where ap = if null os then s else Node (s:reverse os)
 
 -- [(input, expected output)]
 tests :: [(String,String)]
@@ -276,6 +296,7 @@ tests = [
   ("1 + 2 + 3","(+ (+ 1 2) 3)"),
   ("1 + 2 * 3","(+ 1 (* 2 3))"),
   ("1 * 2 + 3","(+ (* 1 2) 3)"),
+  -- TODO test case with 3 binary infix operator with different priorities
 
   ("f a","(f a)"),
   ("f 1","(f 1)"),
@@ -300,24 +321,25 @@ tests = [
   ("(f a) + 1","(+ (f a) 1)"),
   ("(f a b) 1","((f a b) 1)"),
   ("(f a b) 1 2","((f a b) 1 2)"),
-  ("1 + (f a) 2","(+ 1 ((f a) 2))"),
+  ("1 + (f a) 2","(+ 1 ((f a) 2))")
+  , ("f (a + b) (1 - 2)", "(f (+ a b) (- 1 2))")
 
-  ("2","2")
-  ]
+  , ("⟨1⟩", "(1)")
+  , ("⟨a⟩", "(a)")
+  , ("⟨⟨1⟩⟩", "((1))")
+  , ("⟨⟨a⟩⟩", "((a))")
+  , ("⟨+ a b⟩", "(+ a b)")
+  , ("⟨+ a b⟩ * (1 - 2)", "(* (+ a b) (- 1 2))")
+  , ("(a + b) * ⟨- 1 2⟩", "(* (+ a b) (- 1 2))")
+  , ("⟨* (a + b) (1 - 2)⟩", "(* (+ a b) (- 1 2))")
+  , ("⟨* (a + b) ⟨- 1 2⟩⟩", "(* (+ a b) (- 1 2))")
 
-tests' :: [(String,String)]
-tests' =
-  [ ("1","1")
-  , ("a","a")
-  , ("(a)","a")
-  , ("a b","(a b)")
-  , ("a + b","(+ a b)")
-  , ("a * b","(* a b)")
+  , ("true ? 1 : 0", "(?: true 1 0)") -- TODO this sould be _?_:_ or __?__:__ or ␣?␣:␣
+
+  , ("2","2")
   ]
 
 checkTests = mapM_ check tests
-
-checkTests' = mapM_ check tests'
 
 check (i,o) = case parse i of
   S [] [] [[o']] Success ->
