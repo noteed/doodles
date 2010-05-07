@@ -4,10 +4,12 @@
 -- The Shunting-Yard algorithm (modified to allow function
 -- application without parens around the arguments, and just
 -- blanks between arguments).
+-- TODO make sure the rules reflect what's going on, a same
+-- rule should be associated to a same behavior.
 
 module SY where
 
-import Prelude hiding (init)
+import Prelude
 
 data Tree = Node [Tree]
 -- The to-be-shunted tokens. Only the information for the
@@ -15,7 +17,8 @@ data Tree = Node [Tree]
 -- be converted to this representation.
            | Num Int
            | Sym String
-           | In [String] Associativity Precedence -- infix
+           | In [String] [String] Associativity Precedence -- infix
+           | Op [String] -- on the stack
            | L String -- left paren
            | R String -- right paren
 
@@ -33,21 +36,24 @@ display = tail . display'
   display' (Num i) = ' ' : show i
   display' (Sym s) = ' ' : s
   display' (L s) = ' ' : s
-  display' (In [s] _ _) = ' ' : s
-  display' (In s _ _) = ' ' : concat s
+  display' (In l r _ _) = ' ' : concat l ++ concat r
+  display' (Op l) = ' ' : concat l
   display' (R s) = ' ' : s
   display' (Node es) = ' ' : '(' : tail (concatMap display' es) ++ ")"
 
-associativity (In _ a _) = a
+associativity (In _ _ a _) = a
 
-prec (In _ _ p) = p
+prec (In _ _ _ p) = p
 
 assoc = (Associative ==) . associativity
 lAssoc = (LeftAssociative ==) . associativity
 rAssoc = (RightAssociative ==) . associativity
 
-isIn (In _ _ _) = True
+isIn (In _ _ _ _) = True
 isIn _ = False
+
+isIn' (In xs _ _ _) ys = xs == ys
+isIn' _ _ = False
 
 data Rule = Initial
           | Inert -- not an operator or an applicator
@@ -60,6 +66,7 @@ data Rule = Initial
           | UnmatchedL
           | UnmatchedR
           | MatchedR
+          | SExpr
           | Success
           | Blocked
           | Unexpected
@@ -68,7 +75,7 @@ data Rule = Initial
 isDone sh = elem (rule sh)
   [Success, Blocked, UnmatchedL, UnmatchedR, Unexpected]
 
-data Shunt = Shunt {
+data Shunt = S {
     input :: [Tree]    -- list of token (no Node)
   , stack :: [Tree]    -- stack of operators and applicators
   , output :: [[Tree]] -- stack of stacks
@@ -76,20 +83,20 @@ data Shunt = Shunt {
   }
 
 instance Show Shunt where
-  show (Shunt ts ss os r) =
+  show (S ts ss os r) =
     pad 20 ts ++ pad 20 ss ++ pad 20 os ++ "   " ++ show r
 
 pad n s = let s' = show s in replicate (n - length s') ' ' ++ s'
 
 steps s = do
   putStrLn $ "               Input               Stack              Output   Rule"
-  let sh = iterate shunt $ init s
+  let sh = iterate shunt $ initial s
   let l = length $ takeWhile (not . isDone) sh
   mapM_ (putStrLn . show) (take (l + 1) sh)
 
-init s = Shunt (map token $ tokenize s) [] [[]] Initial
+initial s = S (map token $ tokenize s) [] [[]] Initial
 
-parse ts = fix $ init ts
+parse ts = fix $ initial ts
   where fix s = let s' = shunt s in
                 if isDone s' then s' else fix s'
 
@@ -99,95 +106,121 @@ isRight (Right a) = True
 isRight _ = False
 
 shunt :: Shunt -> Shunt
+shunt sh =
+  let lower (Sym a) (Sym b) = lower' someTable a b in
+  case sh of
 
-shunt (Shunt (t@(Num _):ts)    ss                  (os:oss)                _)
-  =    Shunt ts                ss                  ((t:os):oss)            Inert
+  S   (t@(Num _):ts)    ss                  (os:oss)                _ ->
+    S ts                ss                  ((t:os):oss)            Inert
 
-shunt (Shunt (t@(Sym _):ts)    (s@(Sym _):ss)      (os:oss) _)
-  =    Shunt ts                (s:ss)              ((t:os):oss)            Application
+  S   (t@(Sym _):ts)    (s@(L "⟨"):ss)      (os:oss)                _ ->
+    S ts                (s:ss)              ((t:os):oss)            SExpr
 
-shunt (Shunt (t@(Sym _):ts)    (s@(L "⟨"):ss)      (os:oss)                _)
-  =    Shunt ts                (s:ss)              ((t:os):oss)            MatchedR
+  S   (t@(Sym x):ts)    (s@(Sym _):ss)      (os:h:oss) _ ->
+    case findOp x someTable of
+      [] -> S ts        (s:ss)              ((t:os):h:oss)          Application
+      _ ->  S (t:ts)    ss                  ((ap:h):oss)            FlushApp
+    where ap = if null os then s else Node (s : reverse os)
 
-shunt (Shunt (t@(Sym _):ts)    ss                  (os:oss)                _)
-  =    Shunt ts                (t:ss)              ([]:os:oss)             StackApp
+  S   (t@(Sym x):ts) (s@(Op [y]):ss) ((b:a:os):oss)      _ ->
+    case (findOp x someTable, findOp y someTable) of
+      ([], _) -> S ts   (t:s:ss)            ([]:(b:a:os):oss)             StackApp
+      ([o1@(In [_] [] _ _)], [o2@(In [_] [] _ _)])
+        | assoc o1 || (lAssoc o1 && prec o1 <= prec o2) || (rAssoc o1 && prec o1 < prec o2) ->
+          S ts      (Op [x]:ss)           ((Node [s,a,b]:os):oss) StackOp
+        | otherwise ->
+          S ts      (Op [x]:s:ss)         ((b:a:os):oss)          StackOp
 
-shunt (Shunt (t@(In _ _ _):ts) (s@(L "⟨"):ss)      (os:oss)                _)
-  =    Shunt ts                (s:ss)              ((t:os):oss)            MatchedR
+      _ | t `lower` s -> -- TODO this is wrong: every op 'not lower'
+                         -- than t should be popped, not just s.
+          S ts      (t:ss)              ((Node [s,a,b]:os):oss) StackOp
+      _ | otherwise ->
+          S ts      (t:s:ss)            ((b:a:os):oss)          StackOp
 
-shunt (Shunt (t@(In _ _ _):ts) (s@(In [_] _ _):ss) ((b:a:os):oss)          _)
-  | t `lower` s =
-       Shunt ts                (t:ss)              ((Node [s,a,b]:os):oss) StackOp
-  | otherwise =
-       Shunt ts                (t:s:ss)            ((b:a:os):oss)          StackOp
+  S   (t@(Sym x):ts) (s@(Node _):ss)   (os:h:oss)              _ ->
+    case findOp x someTable of
+      [] -> S ts        (s:ss)              ((t:os):h:oss)          Application
+      _ -> S (t:ts)     ss                  ((ap:h):oss)            FlushApp
+    where ap = if null os then s else Node (s : reverse os)
 
-shunt (Shunt (t@(In _ _ _):ts) (s@(Sym _):ss)      (os:h:oss)              _)
-  =    Shunt (t:ts)            ss                  ((ap:h):oss)            FlushApp
-  where ap = if null os then s else Node (s : reverse os)
+  S   (t@(Sym x):ts)    ss                  (os:oss)                _ ->
+    case findOp x someTable of
+      [] -> S ts       (t:ss)              ([]:os:oss)             StackApp
+      -- x is the first sub-op, and the stack is empty or has a left bracket at its top.
+      _ -> case findOp1 x someTable of
+        [] -> error "using middle sub-op as first sub-op"
+        _ -> S ts      (Op [x]:ss)  (os:oss)  StackOp
 
-shunt (Shunt (t@(In _ _ _):ts) (s@(Node _):ss)     (os:h:oss)              _)
-  =    Shunt (t:ts)            ss                  ((ap:h):oss)            FlushApp
-  where ap = if null os then s else Node (s : reverse os)
+  S   (t@(L "⟨"):ts)    ss                  (os:oss)                _ ->
+    S ts                (t:ss)              ([]:os:oss)             StackApp
 
-shunt (Shunt (t@(In _ _ _):ts) ss                  (os:oss)                _)
-  =    Shunt ts                (t:ss)              (os:oss)                StackOp
+  S   (t@(L _):ts)      ss                  (os:oss)                _ ->
+    S ts                (t:ss)              (os:oss)                StackL
 
-shunt (Shunt (t@(L "⟨"):ts)    ss                  (os:oss)                _)
-  =    Shunt ts                (t:ss)              ([]:os:oss)             StackApp
+  S   (t@(R "⟩"):ts)    (s@(L "⟨"):ss)      (os:h:oss)              _ ->
+    S ts                ss                  ((ap:h):oss)            MatchedR
+    where ap = Node (reverse os)
 
-shunt (Shunt (t@(L _):ts)      ss                  (os:oss)                _)
-  =    Shunt ts                (t:ss)              (os:oss)                StackL
+  S   (t:ts)            (s@(L "⟨"):ss)      (os:oss)                _ ->
+    S ts                (s:ss)              ((t:os):oss)            SExpr
 
-shunt (Shunt (t@(R "⟩"):ts)    (s@(L "⟨"):ss)      (os:h:oss)              _)
-  =    Shunt ts                ss                  ((ap:h):oss)            MatchedR
-  where ap = Node (reverse os)
+  S   []                (s@(L _):ss)        oss                     _ ->
+    S []                (s:ss)              oss                     UnmatchedL
 
-shunt (Shunt (t:ts)            (s@(L "⟨"):ss)      (os:oss)                _)
-  =    Shunt ts                (s:ss)              ((t:os):oss)            MatchedR
+  S   (t@(R _):ts)      (s@(L _):ss)        ((o:os):oss)            _ ->
+    S ts                (o':ss)             ([]:os:oss)             MatchedR
+    where -- keep parenthesis around : (1 + ((a))) will be (+ 1 ((a))), not (+ 1 a).
+          -- o' = case o of { Node [_] -> Node [o] ; Node _ -> o ; _ -> Node [o] }
+          -- o' = case o of { Node [_] -> Node [o] ; Node _ -> Node [o] ; _ -> Node [o] }
+          o' = o
 
-shunt (Shunt (t@(R _):ts)      (s@(L _):ss)        ((o:os):oss)            _)
-  =    Shunt ts                (o':ss)             ([]:os:oss)             MatchedR
-  where -- keep parenthesis around : (1 + ((a))) will be (+ 1 ((a))), not (+ 1 a).
-        -- o' = case o of { Node [_] -> Node [o] ; Node _ -> o ; _ -> Node [o] }
-        -- o' = case o of { Node [_] -> Node [o] ; Node _ -> Node [o] ; _ -> Node [o] }
-        o' = o
+  S   (t@(R _):ts)      []                  (os:oss)                _ ->
+    S (t:ts)            []                  (os:oss)                UnmatchedR
 
-shunt (Shunt []                (s@(L _):ss)        oss                     _)
-  =    Shunt []                (s:ss)              oss                     UnmatchedL
+  S   (t@(R _):ts)      (s@(Op _):ss) ((b:a:os):oss)          _ ->
+    S (t:ts)            ss                  ((Node [s,a,b]:os):oss) FlushOp
 
-shunt (Shunt (t@(R _):ts)      []                  (os:oss)                _)
-  =    Shunt (t:ts)            []                  (os:oss)                UnmatchedR
+  S   (t@(R _):ts)      (s@(Sym _):ss)      (os:h:oss)              _ ->
+    S (t:ts)            ss                  ((ap:h):oss)            FlushApp
+    where ap = if null os then s else Node (s : reverse os)
 
-shunt (Shunt (t@(R _):ts)      (s@(In [_] _ _):ss) ((b:a:os):oss)          _)
-  =    Shunt (t:ts)            ss                  ((Node [s,a,b]:os):oss) FlushOp
+  S   (t@(R _):ts)      (s@(Node _):ss)     (os:h:oss)              _ ->
+    S (t:ts)            ss                  ((ap:h):oss)            FlushApp
+    where ap = if null os then s else Node (s : reverse os)
 
-shunt (Shunt (t@(R _):ts)      (s@(Sym _):ss)      (os:h:oss)              _)
-  =    Shunt (t:ts)            ss                  ((ap:h):oss)            FlushApp
-  where ap = if null os then s else Node (s : reverse os)
+  S   []                (s@(Op _):ss) ((b:a:os):oss)          _ ->
+    S []                ss                  ((Node [s,a,b]:os):oss) FlushOp
 
-shunt (Shunt (t@(R _):ts)      (s@(Node _):ss)     (os:h:oss)              _)
-  =    Shunt (t:ts)            ss                  ((ap:h):oss)            FlushApp
-  where ap = if null os then s else Node (s : reverse os)
+  S   []                (s@(Sym _):ss)      (os:h:oss) _ ->
+    S []                ss                  ((ap:h):oss)            FlushApp
+    where ap = if null os then s else Node (s : reverse os)
 
-shunt (Shunt []                (s@(In [_] _ _):ss) ((b:a:os):oss)          _)
-  =    Shunt []                ss                  ((Node [s,a,b]:os):oss) FlushOp
+  S   []                (s@(Node _):ss)     (os:h: oss)             _ ->
+    S []                ss                  ((ap:h):oss)            FlushApp
+    where ap = if null os then s else Node (s : reverse os)
 
-shunt (Shunt []                (s@(Sym _):ss)      (os:h:oss) _)
-  =    Shunt []                ss                  ((ap:h):oss)            FlushApp
-  where ap = if null os then s else Node (s : reverse os)
+  S   []                []                  [[o]]                   _ ->
+    S []                []                  [[o]]                   Success
 
-shunt (Shunt []                (s@(Node _):ss)     (os:h: oss)             _)
-  =    Shunt []                ss                  ((ap:h):oss)            FlushApp
-  where ap = if null os then s else Node (s : reverse os)
+  _ -> sh { rule = Unexpected }
 
-shunt (Shunt []                []                  [[o]]                   _)
-  =    Shunt []                []                  [[o]]                   Success
-
-shunt sh = sh { rule = Unexpected }
-
-lower o1 o2 | assoc o1 || (lAssoc o1 && prec o1 <= prec o2) = True
-            | rAssoc o1 && prec o1 < prec o2 = True
-            | otherwise = False
+lower' someTable a b =
+  case (findOp a someTable, findOp b someTable) of
+   -- binary infix operators
+   ([o1@(In [_] [] _ _)], [o2@(In [_] [] _ _)])
+    | assoc o1 || (lAssoc o1 && prec o1 <= prec o2) -> True
+    | rAssoc o1 && prec o1 < prec o2 -> True
+    | otherwise -> False
+   -- binary infix (b) followed by non-binary infix (a)
+   -- (include the previous case)
+   ([o1@(In [_] _ _ _)], [o2@(In [_] [] _ _)])
+    | assoc o1 || (lAssoc o1 && prec o1 <= prec o2) -> True
+    | rAssoc o1 && prec o1 < prec o2 -> True
+    | otherwise -> False
+   ([o1@(In l1 _ _ _)], [o2@(In l2 _ _ _)])
+    | init l1 == l2 -> False
+   -- ambiguous case or simply unforseen case
+   _ -> error $ "ambiguous: " ++ a ++ ", " ++ b
 
 tokenize = words . tokenize'
 tokenize' ('(':cs) = " ( " ++ tokenize' cs
@@ -197,16 +230,36 @@ tokenize' ('⟩':cs) = " ⟩ " ++ tokenize' cs
 tokenize' (c:cs) = c : tokenize' cs
 tokenize' [] = []
 
-token (c:_) | c `elem` ['a'..'z'] = Sym [c]
-            | c == '+' = In ["+"] LeftAssociative 6
-            | c == '-' = In ["-"] LeftAssociative 6
-            | c == '*' = In ["*"] LeftAssociative 7
-            | c == '/' = In ["/"] LeftAssociative 7
-            | c == '(' = L "("
-            | c == '⟨' = L "⟨"
-            | c == ')' = R ")"
-            | c == '⟩' = R "⟩"
-            | otherwise = Num (read [c])
+token (c:cs) | c `elem` ['a'..'z'] ++ "+-*/?:" = Sym (c:cs)
+             | c == '(' = L "("
+             | c == '⟨' = L "⟨"
+             | c == ')' = R ")"
+             | c == '⟩' = R "⟩"
+             | otherwise = Num (read [c])
+
+someTable =
+ [ In [] ["+"] LeftAssociative 6
+ , In [] ["-"] LeftAssociative 6
+ , In [] ["*"] LeftAssociative 7
+ , In [] ["/"] LeftAssociative 7
+ , In [] ["?",":"] RightAssociative 9
+ ]
+
+findOp op [] = []
+findOp op (In [] parts a p:xs)
+  | op `elem` parts =
+     let (l,r) = break' (== op) parts
+     in In l r a p : findOp op xs
+  | otherwise = findOp op xs
+
+findOp1 op [] = []
+findOp1 op (In [] parts a p:xs)
+  | op == head parts = In [op] (tail parts) a p : findOp1 op xs
+  | otherwise = findOp1 op xs
+
+break' p ls = case break p ls of
+  (_, []) -> error "break': no element in l satisfying p"
+  (l, r) -> (l ++ [head r], tail r)
 
 -- [(input, expected output)]
 tests :: [(String,String)]
@@ -252,17 +305,31 @@ tests = [
   ("2","2")
   ]
 
+tests' :: [(String,String)]
+tests' =
+  [ ("1","1")
+  , ("a","a")
+  , ("(a)","a")
+  , ("a b","(a b)")
+  , ("a + b","(+ a b)")
+  , ("a * b","(* a b)")
+  ]
+
 checkTests = mapM_ check tests
-  where check (i,o) = do case parse i of
-                           Shunt [] [] [[o']] Success ->
-                            if o == show o' then return ()
-                                       else do putStrLn $ "FAIL: input: " ++ i
-                                                 ++ ", expected: " ++ o
-                                                 ++ ", computed: " ++ show o'
-                                               steps i
-                           _ -> do putStrLn $ "FAIL: input: " ++ i
-                                     ++ ", expected: " ++ o
-                                     ++ ", computed: Nothing."
-                                   steps i
+
+checkTests' = mapM_ check tests'
+
+check (i,o) = case parse i of
+  S [] [] [[o']] Success ->
+    if o == show o'
+    then return ()
+    else do putStrLn $ "FAIL: input: " ++ i
+              ++ ", expected: " ++ o
+              ++ ", computed: " ++ show o'
+            steps i
+  _ -> do putStrLn $ "FAIL: input: " ++ i
+            ++ ", expected: " ++ o
+            ++ ", computed: Nothing."
+          steps i
                            
 
