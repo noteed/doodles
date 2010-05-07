@@ -18,6 +18,8 @@ data Tree = Node [Tree]
            | Num Int
            | Sym String
            | In [String] [String] Associativity Precedence -- infix
+           | Pre [String] [String] Precedence -- prefix
+           | Post [String] [String] Precedence -- postfix
            | Op [String] -- on the stack
            | L String -- left paren
            | R String -- right paren
@@ -37,6 +39,8 @@ display = tail . display'
   display' (Sym s) = ' ' : s
   display' (L s) = ' ' : s
   display' (In l r _ _) = ' ' : concat l ++ concat r
+  display' (Pre l r _) = ' ' : concat l ++ concat r
+  display' (Post l r _) = ' ' : concat l ++ concat r
   display' (Op l) = ' ' : concat l
   display' (R s) = ' ' : s
   display' (Node es) = ' ' : '(' : tail (concatMap display' es) ++ ")"
@@ -106,9 +110,15 @@ isRight (Right a) = True
 isRight _ = False
 
 shunt :: Shunt -> Shunt
-shunt sh =
-  let lower (Sym a) (Sym b) = lower' someTable a b in
-  case sh of
+shunt sh = case sh of
+
+  S   ts                (s@(Op y):ss)      ([a]:oss) _ ->
+    case findOps y someTable of
+      [Post _ [] _] -> S (Node [s,a]:ts)    ss           ([]:oss)       FlushApp
+      _ -> shunt' sh
+  _ -> shunt' sh
+
+shunt' sh = case sh of
 
   S   (t@(Num _):ts)    ss                  (os:oss)                _ ->
     S ts                ss                  ((t:os):oss)            Inert
@@ -122,7 +132,8 @@ shunt sh =
   S   (t@(Sym x):ts)    (s@(Sym _):ss)      (os:oss) _ ->
     case findOp x someTable of
       [] -> S ts        (s:ss)              ((t:os):oss)          Application
-      _ ->  S (t:ts)    ss                  (apply s $ os:oss)            FlushApp
+      [Pre _ _ _] -> S ts    (t:s:ss)           ([]:os:oss)       FlushApp
+      _ ->  S (t:ts)    ss                  (apply s $ os:oss)    FlushApp
 
   S   (t@(Node _):ts)   (s@(Sym _):ss)      (os:oss)                _ ->
     S ts                (s:ss)              ((t:os):oss)            Application
@@ -131,13 +142,20 @@ shunt sh =
     case (findOp x someTable, findOps y someTable) of
       ([], _) -> S ts   (t:s:ss)            ([]:oss)             StackApp
       ([o1@(In [_] [] _ _)], [o2@(In [_] [] _ _)])
-        | assoc o1 || (lAssoc o1 && prec o1 <= prec o2) || (rAssoc o1 && prec o1 < prec o2) ->
+        | o1 `lower` o2 ->
+          -- TODO possibly flush more ops
           S ts      (Op [x]:ss)           (apply s oss) StackOp
         | otherwise ->
           S ts      (Op [x]:s:ss)         oss          StackOp
       ([o1@(In l1 r1 _ _)], [o2@(In l2 (r2:r2s) _ _)])
         | l2++[r2] == l1 ->
           S ts      (Op l1:ss)            oss          StackOp
+      ([o1@(In [_] _ _ _)], [o2@(In _ [] _ _)])
+        | o1 `lower` o2 ->
+          -- TODO possibly flush more ops
+          S ts      (Op [x]:ss)           (apply s oss) StackOp
+        | otherwise ->
+          S ts      (Op [x]:s:ss)         oss          StackOp
       _ -> error $ "TODO: " ++ show t ++ ", " ++ show s
 
   S   (t@(Node _):ts) (s@(Op _):ss)       oss                  _ ->
@@ -155,7 +173,7 @@ shunt sh =
     case findOp x someTable of
       [] -> S ts       (t:ss)              ([]:os:oss)             StackApp
       -- x is the first sub-op, and the stack is empty or has a left bracket at its top.
-      _ -> case findOp1 x someTable of
+      _ -> case findOps [x] someTable of
         [] -> error "using middle sub-op as first sub-op"
         _ -> S ts      (Op [x]:ss)  (os:oss)  StackOp
 
@@ -211,23 +229,10 @@ shunt sh =
 
   _ -> sh { rule = Unexpected }
 
-lower' someTable a b =
-  case (findOp a someTable, findOp b someTable) of
-   -- binary infix operators
-   ([o1@(In [_] [] _ _)], [o2@(In [_] [] _ _)])
-    | assoc o1 || (lAssoc o1 && prec o1 <= prec o2) -> True
-    | rAssoc o1 && prec o1 < prec o2 -> True
-    | otherwise -> False
-   -- binary infix (b) followed by non-binary infix (a)
-   -- (include the previous case)
-   ([o1@(In [_] _ _ _)], [o2@(In [_] [] _ _)])
-    | assoc o1 || (lAssoc o1 && prec o1 <= prec o2) -> True
-    | rAssoc o1 && prec o1 < prec o2 -> True
-    | otherwise -> False
-   ([o1@(In l1 _ _ _)], [o2@(In l2 _ _ _)])
-    | init l1 == l2 -> False
-   -- ambiguous case or simply unforseen case
-   _ -> error $ "ambiguous: " ++ a ++ ", " ++ b
+lower o1@(In [_] _ _ _) o2@(In _ [] _ _)
+    | assoc o1 || (lAssoc o1 && prec o1 <= prec o2) = True
+    | rAssoc o1 && prec o1 < prec o2 = True
+lower _ _ = False
 
 tokenize = words . tokenize'
 tokenize' ('(':cs) = " ( " ++ tokenize' cs
@@ -237,7 +242,7 @@ tokenize' ('⟩':cs) = " ⟩ " ++ tokenize' cs
 tokenize' (c:cs) = c : tokenize' cs
 tokenize' [] = []
 
-token (c:cs) | c `elem` ['a'..'z'] ++ "+-*/?:" = Sym (c:cs)
+token (c:cs) | c `elem` ['a'..'z'] ++ "+-*/?:#i!" = Sym (c:cs)
              | c == '(' = L "("
              | c == '⟨' = L "⟨"
              | c == ')' = R ")"
@@ -249,7 +254,10 @@ someTable =
  , In [] ["-"] LeftAssociative 6
  , In [] ["*"] LeftAssociative 7
  , In [] ["/"] LeftAssociative 7
- , In [] ["?",":"] RightAssociative 9
+ , In [] ["?",":"] RightAssociative 5
+ , In [] ["?'", ":'"] RightAssociative 9
+ , Pre [] ["#"] 8
+ , Post [] ["!"] 8
  ]
 
 findOp op [] = []
@@ -258,16 +266,26 @@ findOp op (In [] parts a p:xs)
      let (l,r) = break' (== op) parts
      in In l r a p : findOp op xs
   | otherwise = findOp op xs
-
--- TODO this is a special case of findOps
-findOp1 op [] = []
-findOp1 op (In [] parts a p:xs)
-  | op == head parts = In [op] (tail parts) a p : findOp1 op xs
-  | otherwise = findOp1 op xs
+findOp op (Pre [] parts p:xs)
+  | op `elem` parts =
+     let (l,r) = break' (== op) parts
+     in Pre l r p : findOp op xs
+  | otherwise = findOp op xs
+findOp op (Post [] parts p:xs)
+  | op `elem` parts =
+     let (l,r) = break' (== op) parts
+     in Post l r p : findOp op xs
+  | otherwise = findOp op xs
 
 findOps ops [] = []
 findOps ops (In [] parts a p:xs)
   | ops `isPrefixOf` parts = In ops (drop (length ops) parts) a p : findOps ops xs
+  | otherwise = findOps ops xs
+findOps ops (Pre [] parts p:xs)
+  | ops `isPrefixOf` parts = Pre ops (drop (length ops) parts) p : findOps ops xs
+  | otherwise = findOps ops xs
+findOps ops (Post [] parts p:xs)
+  | ops `isPrefixOf` parts = Post ops (drop (length ops) parts) p : findOps ops xs
   | otherwise = findOps ops xs
 
 break' p ls = case break p ls of
@@ -275,11 +293,15 @@ break' p ls = case break p ls of
   (l, r) -> (l ++ [head r], tail r)
 
 apply s@(Op y) (os:oss) = (Node (s:reverse l) : r) : oss
-  where (l,r) = splitAt (length y + 1) os -- TODO test correct lenght of os
+  where nargs = case findOps y someTable of
+          [In _ _ _ _] -> length y + 1
+          [_] -> length y
+        (l,r) = splitAt nargs os -- TODO test correct lenght of os
 apply s@(Sym _) (os:h:oss) =  (ap:h):oss
   where ap = if null os then s else Node (s:reverse os)
 apply s@(Node _) (os:h:oss) =  (ap:h):oss
   where ap = if null os then s else Node (s:reverse os)
+apply s oss = error $ "can't apply " ++ show s ++ " to " ++ show oss
 
 -- [(input, expected output)]
 tests :: [(String,String)]
@@ -335,6 +357,14 @@ tests = [
   , ("⟨* (a + b) ⟨- 1 2⟩⟩", "(* (+ a b) (- 1 2))")
 
   , ("true ? 1 : 0", "(?: true 1 0)") -- TODO this sould be _?_:_ or __?__:__ or ␣?␣:␣
+  , ("true ? 1 : 0 + 1", "(?: true 1 (+ 0 1))")
+  , ("true ?' 1 :' 0 + 1", "(+ (?':' true 1 0) 1)")
+
+  , ("# a", "(# a)")
+  , ("a # b", "(a (# b))")
+
+  , ("a !", "(! a)")
+  , ("a ! b", "((! a) b)")
 
   , ("2","2")
   ]
