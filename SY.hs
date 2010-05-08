@@ -156,6 +156,8 @@ shunt' sh = case sh of
           S ts      (Op [x]:ss)           (apply s oss) StackOp
         | otherwise ->
           S ts      (Op [x]:s:ss)         oss          StackOp
+      ([o1@(Pre [_] [] _)], [o2@(Pre [_] [] _)]) ->
+          S ts      (Op [x]:s:ss)         oss          StackOp
       _ -> error $ "TODO: " ++ show t ++ ", " ++ show s
 
   S   (t@(Node _):ts) (s@(Op _):ss)       oss                  _ ->
@@ -257,7 +259,7 @@ someTable =
  , In [] ["?",":"] RightAssociative 5
  , In [] ["?'", ":'"] RightAssociative 9
  , Pre [] ["#"] 8
- , Post [] ["!"] 8
+ , Post [] ["!"] 9
  ]
 
 findOp op [] = []
@@ -362,9 +364,13 @@ tests = [
 
   , ("# a", "(# a)")
   , ("a # b", "(a (# b))")
+  , ("# # a", "(# (# a))")
 
   , ("a !", "(! a)")
   , ("a ! b", "((! a) b)")
+  , ("a ! !", "(! (! a))")
+
+  , ("# a !", "(# (! a))")
 
   , ("2","2")
   ]
