@@ -6,6 +6,9 @@
 -- blanks between arguments).
 -- TODO make sure the rules reflect what's going on, a same
 -- rule should be associated to a same behavior.
+-- TODO the precedence comparison should depends on the
+-- associativity even for Pre/Postfix (see 'lower').
+-- TODO factorize
 
 module SY where
 
@@ -132,7 +135,7 @@ shunt' sh = case sh of
   S   (t@(Sym x):ts)    (s@(Sym _):ss)      (os:oss) _ ->
     case findOp x someTable of
       [] -> S ts        (s:ss)              ((t:os):oss)          Application
-      [Pre _ _ _] -> S ts    (t:s:ss)           ([]:os:oss)       FlushApp
+      [Pre [_] _ _] -> S ts    (t:s:ss)     ([]:os:oss)           StackOp
       _ ->  S (t:ts)    ss                  (apply s $ os:oss)    FlushApp
 
   S   (t@(Node _):ts)   (s@(Sym _):ss)      (os:oss)                _ ->
@@ -156,8 +159,24 @@ shunt' sh = case sh of
           S ts      (Op [x]:ss)           (apply s oss) StackOp
         | otherwise ->
           S ts      (Op [x]:s:ss)         oss          StackOp
+      ([o1@(In _ _ _ p1)], [o2@(Pre _ _ p2)])
+        | p1 > p2 ->
+          S ts      (Op [x]:s:ss)         oss          StackOp
+        | p1 < p2 ->
+          S ts      (Op [x]:ss)           (apply s oss) StackOp
+      ([o1@(Pre [_] _ _)], [o2@(In [_] _ _ _)]) ->
+          S ts      (Op [x]:s:ss)         oss          StackOp
       ([o1@(Pre [_] [] _)], [o2@(Pre [_] [] _)]) ->
           S ts      (Op [x]:s:ss)         oss          StackOp
+      ([o1@(Pre l1 r1 _)], [o2@(Pre l2 (r2:r2s) _)])
+        | l2++[r2] == l1 ->
+          S ts      (Op l1:ss)            oss          StackOp
+      ([o1@(Post [_] [] p1)], [o2@(Pre [_] [] p2)])
+        | p1 > p2 ->
+          S ts      (Op [x]:s:ss)         oss          StackOp
+        | p1 < p2 ->
+          S ts      (Op [x]:ss)           (apply s oss) StackOp
+        | otherwise -> error $ "precedence cannot be mixed: " ++ show t ++ ", " ++ show s
       _ -> error $ "TODO: " ++ show t ++ ", " ++ show s
 
   S   (t@(Node _):ts) (s@(Op _):ss)       oss                  _ ->
@@ -244,7 +263,7 @@ tokenize' ('⟩':cs) = " ⟩ " ++ tokenize' cs
 tokenize' (c:cs) = c : tokenize' cs
 tokenize' [] = []
 
-token (c:cs) | c `elem` ['a'..'z'] ++ "+-*/?:#i!" = Sym (c:cs)
+token (c:cs) | c `elem` ['a'..'z'] ++ "+-*/?:#i°%!" = Sym (c:cs)
              | c == '(' = L "("
              | c == '⟨' = L "⟨"
              | c == ')' = R ")"
@@ -259,7 +278,10 @@ someTable =
  , In [] ["?",":"] RightAssociative 5
  , In [] ["?'", ":'"] RightAssociative 9
  , Pre [] ["#"] 8
+ , Post [] ["°"] 7
+ , Post [] ["%"] 8
  , Post [] ["!"] 9
+ , Pre [] ["if","then","else"] 1
  ]
 
 findOp op [] = []
@@ -370,7 +392,17 @@ tests = [
   , ("a ! b", "((! a) b)")
   , ("a ! !", "(! (! a))")
 
+  , ("# a °", "(° (# a))")
+--  , ("# a %", Error "precedence cannot be mixed")
   , ("# a !", "(# (! a))")
+
+  , ("if true then 1 else 0", "(ifthenelse true 1 0)")
+  , ("if 2 then 1 else 0", "(ifthenelse 2 1 0)")
+  , ("if a b then 1 else 0", "(ifthenelse (a b) 1 0)")
+  , ("if true then a b else 0", "(ifthenelse true (a b) 0)")
+  , ("if true then 1 else a b", "(ifthenelse true 1 (a b))")
+  , ("1 + if true then 1 else 0", "(+ 1 (ifthenelse true 1 0))")
+  , ("1 + if true then 1 else a b + c", "(+ 1 (ifthenelse true 1 (+ (a b) c)))")
 
   , ("2","2")
   ]
