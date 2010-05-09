@@ -20,12 +20,13 @@ data Tree = Node [Tree]
 -- be converted to this representation.
            | Num Int
            | Sym String
-           | In [String] [String] Associativity Precedence -- infix
-           | Pre [String] [String] Precedence -- prefix
-           | Post [String] [String] Precedence -- postfix
-           | Op [String] -- on the stack
+           | Op [String] -- on the stack, TODO turn into Sym on the output
            | L String -- left paren
            | R String -- right paren
+
+data Op = In [String] [String] Associativity Precedence -- infix
+        | Pre [String] [String] Precedence -- prefix
+        | Post [String] [String] Precedence -- postfix
 
 data Associativity = Associative | LeftAssociative | RightAssociative
   deriving (Show, Eq)
@@ -41,9 +42,6 @@ display = tail . display'
   display' (Num i) = ' ' : show i
   display' (Sym s) = ' ' : s
   display' (L s) = ' ' : s
-  display' (In l r _ _) = ' ' : concat l ++ concat r
-  display' (Pre l r _) = ' ' : concat l ++ concat r
-  display' (Post l r _) = ' ' : concat l ++ concat r
   display' (Op l) = ' ' : concat l
   display' (R s) = ' ' : s
   display' (Node es) = ' ' : '(' : tail (concatMap display' es) ++ ")"
