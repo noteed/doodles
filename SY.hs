@@ -29,6 +29,7 @@ data Op = Infix [String] [String] Associativity Precedence -- infix
         | Prefix [String] [String] Precedence -- prefix
         | Postfix [String] [String] Precedence -- postfix
         | Closed [String] [String]
+  deriving Show
 
 data Associativity = Associative | LeftAssociative | RightAssociative
   deriving (Show, Eq)
@@ -185,8 +186,10 @@ shunt' sh = case sh of
           where ((o:os):oss') = apply (Op l1) oss
       ([o1], [o2@(Closed _ _)]) ->
           S ts      (Op [x]:s:ss)         oss          StackOp
-      ([o1@(Closed _ _)], [_]) ->
+      ([o1@(Closed _ [])], [_]) ->
           S (t:ts)            ss                  (apply s oss) FlushOp
+      ([o1@(Closed _ _)], [_]) ->
+          S ts      (Op [x]:s:ss)           oss FlushOp
       _ -> error $ "TODO: " ++ show t ++ ", " ++ show s
 
   S   (t@(Node _):ts) (s@(Op _):ss)       oss                  _ ->
@@ -338,7 +341,9 @@ break' p ls = case break p ls of
 apply s@(Op y) (os:oss) = (Node (s:reverse l) : r) : oss
   where nargs = case findOps y someTable of
           [Infix _ _ _ _] -> length y + 1
+          [Closed _ _] -> length y - 1
           [_] -> length y
+          [] -> error $ "bug: wrong use of apply: " ++ show y
         (l,r) = splitAt nargs os -- TODO test correct lenght of os
 apply s@(Sym _) (os:h:oss) =  (ap:h):oss
   where ap = if null os then s else Node (s:reverse os)
@@ -428,6 +433,10 @@ tests = [
   , ("</ f a b />","(<//> (f a b))")
   , ("</ f 1 2 />","(<//> (f 1 2))")
   , ("</ a + b />","(<//> (+ a b))")
+  , ("</ a + b * 2 />","(<//> (+ a (* b 2)))")
+  , ("</ a /> + 1","(+ (<//> a) 1)")
+  , ("1 + </ a />","(+ 1 (<//> a))")
+  , ("1 + </ a - b /> * 2","(+ 1 (* (<//> (- a b)) 2))")
 
   , ("2","2")
   ]
