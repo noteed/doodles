@@ -147,12 +147,8 @@ shunt' sh = case sh of
   S   (t@(Sym x):ts) (s@(Op y):ss) oss      _ ->
     case (findOp x someTable, findOps y someTable) of
       ([], _) -> S ts   (t:s:ss)            ([]:oss)             StackApp
-      ([o1@(Infix [_] [] _ _)], [o2@(Infix [_] [] _ _)])
-        | o1 `lower` o2 ->
-          -- TODO possibly flush more ops
-          S ts      (Op [x]:ss)           (apply s oss) StackOp
-        | otherwise ->
-          S ts      (Op [x]:s:ss)         oss          StackOp
+      ([o1@(Infix [_] [] _ _)], [o2@(Infix [_] [] _ _)]) ->
+        flushLower o1 x ts (s:ss) oss
       ([o1@(Infix l1 r1 _ _)], [o2@(Infix l2 (r2:r2s) _ _)])
         | l2++[r2] == l1 ->
           S ts      (Op l1:ss)            oss          StackOp
@@ -268,6 +264,15 @@ lower o1@(Infix [_] _ _ _) o2@(Infix _ [] _ _)
     | rAssoc o1 && prec o1 < prec o2 = True
 lower _ _ = False
 
+flushLower o1 x ts (s@(Op y):ss) oss = case findOps y someTable of
+  [o2@(Infix [_] [] _ _)]
+    | o1 `lower` o2 ->
+      flushLower o1 x ts ss (apply s oss)
+    | otherwise ->
+      S ts      (Op [x]:s:ss)         oss          StackOp
+flushLower o1 x ts ss oss =
+   S ts      (Op [x]:ss)         oss          StackOp
+
 tokenize = words . tokenize'
 tokenize' ('(':cs) = " ( " ++ tokenize' cs
 tokenize' (')':cs) = " ) " ++ tokenize' cs
@@ -284,7 +289,9 @@ token (c:cs) | c `elem` ['a'..'z'] ++ "+-*/?:#i°%!<>" = Sym (c:cs)
              | otherwise = Num (read [c])
 
 someTable =
- [ Infix [] ["+"] LeftAssociative 6
+ [ Infix [] ["<<"] LeftAssociative 5
+ , Infix [] [">>"] LeftAssociative 5
+ , Infix [] ["+"] LeftAssociative 6
  , Infix [] ["-"] LeftAssociative 6
  , Infix [] ["*"] LeftAssociative 7
  , Infix [] ["/"] LeftAssociative 7
@@ -365,10 +372,23 @@ tests = [
 
   ("1 + 2 + 3","(+ (+ 1 2) 3)"),
   ("1 + 2 * 3","(+ 1 (* 2 3))"),
-  ("1 * 2 + 3","(+ (* 1 2) 3)"),
-  -- TODO test case with 3 binary infix operator with different priorities
+  ("1 * 2 + 3","(+ (* 1 2) 3)")
 
-  ("f a","(f a)"),
+  , ("0 << 1 + 2 * 3", "(<< 0 (+ 1 (* 2 3)))")
+  , ("0 + 1 << 2 * 3", "(<< (+ 0 1) (* 2 3))")
+  , ("0 + 1 * 2 << 3", "(<< (+ 0 (* 1 2)) 3)")
+  , ("0 << 1 * 2 + 3", "(<< 0 (+ (* 1 2) 3))")
+  , ("0 * 1 << 2 + 3", "(<< (* 0 1) (+ 2 3))")
+  , ("0 * 1 + 2 << 3", "(<< (+ (* 0 1) 2) 3)")
+  , ("(0 << 1) + 2 * 3", "(+ (<< 0 1) (* 2 3))")
+  , ("0 << (1 + 2) * 3", "(<< 0 (* (+ 1 2) 3))")
+  , ("0 << 1 + (2 * 3)", "(<< 0 (+ 1 (* 2 3)))")
+  , ("((0 << 1) + 2) * 3", "(* (+ (<< 0 1) 2) 3)")
+  , ("(((0 << 1) + 2) * 3)", "(* (+ (<< 0 1) 2) 3)")
+  , ("⟨<< 0 1⟩ + 2 * 3", "(+ (<< 0 1) (* 2 3))")
+  , ("⟨+ ⟨<< 0 1⟩ 2⟩ * 3", "(* (+ (<< 0 1) 2) 3)")
+
+  , ("f a","(f a)"),
   ("f 1","(f 1)"),
   ("f a b","(f a b)"),
   ("f 1 b","(f 1 b)"),
