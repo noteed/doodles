@@ -25,9 +25,9 @@ data Tree = Node [Tree]
            | L String -- left paren
            | R String -- right paren
 
-data Op = In [String] [String] Associativity Precedence -- infix
-        | Pre [String] [String] Precedence -- prefix
-        | Post [String] [String] Precedence -- postfix
+data Op = Infix [String] [String] Associativity Precedence -- infix
+        | Prefix [String] [String] Precedence -- prefix
+        | Postfix [String] [String] Precedence -- postfix
         | Closed [String] [String]
 
 data Associativity = Associative | LeftAssociative | RightAssociative
@@ -48,19 +48,19 @@ display = tail . display'
   display' (R s) = ' ' : s
   display' (Node es) = ' ' : '(' : tail (concatMap display' es) ++ ")"
 
-associativity (In _ _ a _) = a
+associativity (Infix _ _ a _) = a
 
-prec (In _ _ _ p) = p
+prec (Infix _ _ _ p) = p
 
 assoc = (Associative ==) . associativity
 lAssoc = (LeftAssociative ==) . associativity
 rAssoc = (RightAssociative ==) . associativity
 
-isIn (In _ _ _ _) = True
-isIn _ = False
+isInfix (Infix _ _ _ _) = True
+isInfix _ = False
 
-isIn' (In xs _ _ _) ys = xs == ys
-isIn' _ _ = False
+isInfix' (Infix xs _ _ _) ys = xs == ys
+isInfix' _ _ = False
 
 data Rule = Initial
           | Inert -- not an operator or an applicator
@@ -117,7 +117,7 @@ shunt sh = case sh of
 
   S   ts                (s@(Op y):ss)      ([a]:oss) _ ->
     case findOps y someTable of
-      [Post _ [] _] -> S (Node [s,a]:ts)    ss           ([]:oss)       FlushApp
+      [Postfix _ [] _] -> S (Node [s,a]:ts)    ss           ([]:oss)       FlushApp
       [Closed _ []] -> S (Node [s,a]:ts)    ss           ([]:oss)       FlushApp
       _ -> shunt' sh
   _ -> shunt' sh
@@ -136,7 +136,7 @@ shunt' sh = case sh of
   S   (t@(Sym x):ts)    (s@(Sym _):ss)      (os:oss) _ ->
     case findOp x someTable of
       [] -> S ts        (s:ss)              ((t:os):oss)          Application
-      [Pre [_] _ _] -> S ts    (t:s:ss)     ([]:os:oss)           StackOp
+      [Prefix [_] _ _] -> S ts    (t:s:ss)     ([]:os:oss)           StackOp
       [Closed [_] _] -> S ts   (t:s:ss)     ([]:os:oss)           StackOp
       _ ->  S (t:ts)    ss                  (apply s $ os:oss)    FlushApp
 
@@ -146,34 +146,34 @@ shunt' sh = case sh of
   S   (t@(Sym x):ts) (s@(Op y):ss) oss      _ ->
     case (findOp x someTable, findOps y someTable) of
       ([], _) -> S ts   (t:s:ss)            ([]:oss)             StackApp
-      ([o1@(In [_] [] _ _)], [o2@(In [_] [] _ _)])
+      ([o1@(Infix [_] [] _ _)], [o2@(Infix [_] [] _ _)])
         | o1 `lower` o2 ->
           -- TODO possibly flush more ops
           S ts      (Op [x]:ss)           (apply s oss) StackOp
         | otherwise ->
           S ts      (Op [x]:s:ss)         oss          StackOp
-      ([o1@(In l1 r1 _ _)], [o2@(In l2 (r2:r2s) _ _)])
+      ([o1@(Infix l1 r1 _ _)], [o2@(Infix l2 (r2:r2s) _ _)])
         | l2++[r2] == l1 ->
           S ts      (Op l1:ss)            oss          StackOp
-      ([o1@(In [_] _ _ _)], [o2@(In _ [] _ _)])
+      ([o1@(Infix [_] _ _ _)], [o2@(Infix _ [] _ _)])
         | o1 `lower` o2 ->
           -- TODO possibly flush more ops
           S ts      (Op [x]:ss)           (apply s oss) StackOp
         | otherwise ->
           S ts      (Op [x]:s:ss)         oss          StackOp
-      ([o1@(In _ _ _ p1)], [o2@(Pre _ _ p2)])
+      ([o1@(Infix _ _ _ p1)], [o2@(Prefix _ _ p2)])
         | p1 > p2 ->
           S ts      (Op [x]:s:ss)         oss          StackOp
         | p1 < p2 ->
           S ts      (Op [x]:ss)           (apply s oss) StackOp
-      ([o1@(Pre [_] _ _)], [o2@(In [_] _ _ _)]) ->
+      ([o1@(Prefix [_] _ _)], [o2@(Infix [_] _ _ _)]) ->
           S ts      (Op [x]:s:ss)         oss          StackOp
-      ([o1@(Pre [_] [] _)], [o2@(Pre [_] [] _)]) ->
+      ([o1@(Prefix [_] [] _)], [o2@(Prefix [_] [] _)]) ->
           S ts      (Op [x]:s:ss)         oss          StackOp
-      ([o1@(Pre l1 r1 _)], [o2@(Pre l2 (r2:r2s) _)])
+      ([o1@(Prefix l1 r1 _)], [o2@(Prefix l2 (r2:r2s) _)])
         | l2++[r2] == l1 ->
           S ts      (Op l1:ss)            oss          StackOp
-      ([o1@(Post [_] [] p1)], [o2@(Pre [_] [] p2)])
+      ([o1@(Postfix [_] [] p1)], [o2@(Prefix [_] [] p2)])
         | p1 > p2 ->
           S ts      (Op [x]:s:ss)         oss          StackOp
         | p1 < p2 ->
@@ -260,7 +260,7 @@ shunt' sh = case sh of
 
   _ -> sh { rule = Unexpected }
 
-lower o1@(In [_] _ _ _) o2@(In _ [] _ _)
+lower o1@(Infix [_] _ _ _) o2@(Infix _ [] _ _)
     | assoc o1 || (lAssoc o1 && prec o1 <= prec o2) = True
     | rAssoc o1 && prec o1 < prec o2 = True
 lower _ _ = False
@@ -281,35 +281,35 @@ token (c:cs) | c `elem` ['a'..'z'] ++ "+-*/?:#i°%!<>" = Sym (c:cs)
              | otherwise = Num (read [c])
 
 someTable =
- [ In [] ["+"] LeftAssociative 6
- , In [] ["-"] LeftAssociative 6
- , In [] ["*"] LeftAssociative 7
- , In [] ["/"] LeftAssociative 7
- , In [] ["?",":"] RightAssociative 5
- , In [] ["?'", ":'"] RightAssociative 9
- , Pre [] ["#"] 8
- , Post [] ["°"] 7
- , Post [] ["%"] 8
- , Post [] ["!"] 9
- , Pre [] ["if","then","else"] 1
+ [ Infix [] ["+"] LeftAssociative 6
+ , Infix [] ["-"] LeftAssociative 6
+ , Infix [] ["*"] LeftAssociative 7
+ , Infix [] ["/"] LeftAssociative 7
+ , Infix [] ["?",":"] RightAssociative 5
+ , Infix [] ["?'", ":'"] RightAssociative 9
+ , Prefix [] ["#"] 8
+ , Postfix [] ["°"] 7
+ , Postfix [] ["%"] 8
+ , Postfix [] ["!"] 9
+ , Prefix [] ["if","then","else"] 1
  , Closed [] ["</","/>"]
  ]
 
 findOp op [] = []
-findOp op (In [] parts a p:xs)
+findOp op (Infix [] parts a p:xs)
   | op `elem` parts =
      let (l,r) = break' (== op) parts
-     in In l r a p : findOp op xs
+     in Infix l r a p : findOp op xs
   | otherwise = findOp op xs
-findOp op (Pre [] parts p:xs)
+findOp op (Prefix [] parts p:xs)
   | op `elem` parts =
      let (l,r) = break' (== op) parts
-     in Pre l r p : findOp op xs
+     in Prefix l r p : findOp op xs
   | otherwise = findOp op xs
-findOp op (Post [] parts p:xs)
+findOp op (Postfix [] parts p:xs)
   | op `elem` parts =
      let (l,r) = break' (== op) parts
-     in Post l r p : findOp op xs
+     in Postfix l r p : findOp op xs
   | otherwise = findOp op xs
 findOp op (Closed [] parts:xs)
   | op `elem` parts =
@@ -318,14 +318,14 @@ findOp op (Closed [] parts:xs)
   | otherwise = findOp op xs
 
 findOps ops [] = []
-findOps ops (In [] parts a p:xs)
-  | ops `isPrefixOf` parts = In ops (drop (length ops) parts) a p : findOps ops xs
+findOps ops (Infix [] parts a p:xs)
+  | ops `isPrefixOf` parts = Infix ops (drop (length ops) parts) a p : findOps ops xs
   | otherwise = findOps ops xs
-findOps ops (Pre [] parts p:xs)
-  | ops `isPrefixOf` parts = Pre ops (drop (length ops) parts) p : findOps ops xs
+findOps ops (Prefix [] parts p:xs)
+  | ops `isPrefixOf` parts = Prefix ops (drop (length ops) parts) p : findOps ops xs
   | otherwise = findOps ops xs
-findOps ops (Post [] parts p:xs)
-  | ops `isPrefixOf` parts = Post ops (drop (length ops) parts) p : findOps ops xs
+findOps ops (Postfix [] parts p:xs)
+  | ops `isPrefixOf` parts = Postfix ops (drop (length ops) parts) p : findOps ops xs
   | otherwise = findOps ops xs
 findOps ops (Closed [] parts:xs)
   | ops `isPrefixOf` parts = Closed ops (drop (length ops) parts) : findOps ops xs
@@ -337,7 +337,7 @@ break' p ls = case break p ls of
 
 apply s@(Op y) (os:oss) = (Node (s:reverse l) : r) : oss
   where nargs = case findOps y someTable of
-          [In _ _ _ _] -> length y + 1
+          [Infix _ _ _ _] -> length y + 1
           [_] -> length y
         (l,r) = splitAt nargs os -- TODO test correct lenght of os
 apply s@(Sym _) (os:h:oss) =  (ap:h):oss
