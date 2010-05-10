@@ -9,6 +9,7 @@
 -- TODO the precedence comparison should depends on the
 -- associativity even for Pre/Postfix (see 'lower').
 -- TODO factorize
+-- TODO regroup Closed and L and R
 
 module SY where
 
@@ -27,6 +28,7 @@ data Tree = Node [Tree]
 data Op = In [String] [String] Associativity Precedence -- infix
         | Pre [String] [String] Precedence -- prefix
         | Post [String] [String] Precedence -- postfix
+        | Closed [String] [String]
 
 data Associativity = Associative | LeftAssociative | RightAssociative
   deriving (Show, Eq)
@@ -116,6 +118,7 @@ shunt sh = case sh of
   S   ts                (s@(Op y):ss)      ([a]:oss) _ ->
     case findOps y someTable of
       [Post _ [] _] -> S (Node [s,a]:ts)    ss           ([]:oss)       FlushApp
+      [Closed _ []] -> S (Node [s,a]:ts)    ss           ([]:oss)       FlushApp
       _ -> shunt' sh
   _ -> shunt' sh
 
@@ -134,6 +137,7 @@ shunt' sh = case sh of
     case findOp x someTable of
       [] -> S ts        (s:ss)              ((t:os):oss)          Application
       [Pre [_] _ _] -> S ts    (t:s:ss)     ([]:os:oss)           StackOp
+      [Closed [_] _] -> S ts   (t:s:ss)     ([]:os:oss)           StackOp
       _ ->  S (t:ts)    ss                  (apply s $ os:oss)    FlushApp
 
   S   (t@(Node _):ts)   (s@(Sym _):ss)      (os:oss)                _ ->
@@ -175,6 +179,14 @@ shunt' sh = case sh of
         | p1 < p2 ->
           S ts      (Op [x]:ss)           (apply s oss) StackOp
         | otherwise -> error $ "precedence cannot be mixed: " ++ show t ++ ", " ++ show s
+      ([o1@(Closed l1 [])], [o2@(Closed l2 [r2])])
+        | l2++[r2] == l1 ->
+          S (o:ts)           ss       (os:oss')      MatchedR
+          where ((o:os):oss') = apply (Op l1) oss
+      ([o1], [o2@(Closed _ _)]) ->
+          S ts      (Op [x]:s:ss)         oss          StackOp
+      ([o1@(Closed _ _)], [_]) ->
+          S (t:ts)            ss                  (apply s oss) FlushOp
       _ -> error $ "TODO: " ++ show t ++ ", " ++ show s
 
   S   (t@(Node _):ts) (s@(Op _):ss)       oss                  _ ->
@@ -261,7 +273,7 @@ tokenize' ('⟩':cs) = " ⟩ " ++ tokenize' cs
 tokenize' (c:cs) = c : tokenize' cs
 tokenize' [] = []
 
-token (c:cs) | c `elem` ['a'..'z'] ++ "+-*/?:#i°%!" = Sym (c:cs)
+token (c:cs) | c `elem` ['a'..'z'] ++ "+-*/?:#i°%!<>" = Sym (c:cs)
              | c == '(' = L "("
              | c == '⟨' = L "⟨"
              | c == ')' = R ")"
@@ -280,6 +292,7 @@ someTable =
  , Post [] ["%"] 8
  , Post [] ["!"] 9
  , Pre [] ["if","then","else"] 1
+ , Closed [] ["</","/>"]
  ]
 
 findOp op [] = []
@@ -298,6 +311,11 @@ findOp op (Post [] parts p:xs)
      let (l,r) = break' (== op) parts
      in Post l r p : findOp op xs
   | otherwise = findOp op xs
+findOp op (Closed [] parts:xs)
+  | op `elem` parts =
+     let (l,r) = break' (== op) parts
+     in Closed l r : findOp op xs
+  | otherwise = findOp op xs
 
 findOps ops [] = []
 findOps ops (In [] parts a p:xs)
@@ -308,6 +326,9 @@ findOps ops (Pre [] parts p:xs)
   | otherwise = findOps ops xs
 findOps ops (Post [] parts p:xs)
   | ops `isPrefixOf` parts = Post ops (drop (length ops) parts) p : findOps ops xs
+  | otherwise = findOps ops xs
+findOps ops (Closed [] parts:xs)
+  | ops `isPrefixOf` parts = Closed ops (drop (length ops) parts) : findOps ops xs
   | otherwise = findOps ops xs
 
 break' p ls = case break p ls of
@@ -401,6 +422,12 @@ tests = [
   , ("if true then 1 else a b", "(ifthenelse true 1 (a b))")
   , ("1 + if true then 1 else 0", "(+ 1 (ifthenelse true 1 0))")
   , ("1 + if true then 1 else a b + c", "(+ 1 (ifthenelse true 1 (+ (a b) c)))")
+
+  , ("</ a />","(<//> a)")
+  , ("</ 0 />","(<//> 0)")
+  , ("</ f a b />","(<//> (f a b))")
+  , ("</ f 1 2 />","(<//> (f 1 2))")
+  , ("</ a + b />","(<//> (+ a b))")
 
   , ("2","2")
   ]
