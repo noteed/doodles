@@ -9,7 +9,8 @@
 -- TODO the precedence comparison should depends on the
 -- associativity even for Pre/Postfix (see 'lower').
 -- TODO factorize
--- TODO regroup Closed and L and R
+-- TODO regroup Closed and L and R?
+-- TODO is ! a + b allowed if ! and + have the same precedence?
 
 module SY where
 
@@ -31,7 +32,7 @@ data Op = Infix [String] [String] Associativity Precedence -- infix
         | Closed [String] [String]
   deriving Show
 
-data Associativity = Associative | LeftAssociative | RightAssociative
+data Associativity = NonAssociative | LeftAssociative | RightAssociative
   deriving (Show, Eq)
 
 type Precedence = Int
@@ -47,13 +48,13 @@ display = tail . display'
   display' (L s) = ' ' : s
   display' (Op l) = ' ' : concat l
   display' (R s) = ' ' : s
-  display' (Node es) = ' ' : '(' : tail (concatMap display' es) ++ ")"
+  display' (Node es) = ' ' : '⟨' : tail (concatMap display' es) ++ "⟩"
 
 associativity (Infix _ _ a _) = a
 
 prec (Infix _ _ _ p) = p
 
-assoc = (Associative ==) . associativity
+nonAssoc = (NonAssociative ==) . associativity
 lAssoc = (LeftAssociative ==) . associativity
 rAssoc = (RightAssociative ==) . associativity
 
@@ -180,6 +181,9 @@ shunt' sh = case sh of
         | l2++[r2] == l1 ->
           S (o:ts)           ss       (os:oss')      MatchedR
           where ((o:os):oss') = apply (Op l1) oss
+      ([o1@(Closed l1 r1)], [o2@(Closed l2 (r2:r2s))])
+        | l2++[r2] == l1 ->
+          S ts      (Op l1:ss)            oss          StackOp
       ([o1], [o2@(Closed _ _)]) ->
           S ts      (Op [x]:s:ss)         oss          StackOp
       ([o1@(Closed _ [])], [_]) ->
@@ -260,7 +264,7 @@ shunt' sh = case sh of
   _ -> sh { rule = Unexpected }
 
 lower o1@(Infix [_] _ _ _) o2@(Infix _ [] _ _)
-    | assoc o1 || (lAssoc o1 && prec o1 <= prec o2) = True
+    | nonAssoc o1 || (lAssoc o1 && prec o1 <= prec o2) = True
     | rAssoc o1 && prec o1 < prec o2 = True
 lower _ _ = False
 
@@ -281,7 +285,7 @@ tokenize' ('⟩':cs) = " ⟩ " ++ tokenize' cs
 tokenize' (c:cs) = c : tokenize' cs
 tokenize' [] = []
 
-token (c:cs) | c `elem` ['a'..'z'] ++ "+-*/?:#i°%!<>" = Sym (c:cs)
+token (c:cs) | c `elem` ['a'..'z'] ++ "+-*/?:#i°%!<>[]|," = Sym (c:cs)
              | c == '(' = L "("
              | c == '⟨' = L "⟨"
              | c == ')' = R ")"
@@ -303,6 +307,8 @@ someTable =
  , Postfix [] ["!"] 9
  , Prefix [] ["if","then","else"] 1
  , Closed [] ["</","/>"]
+ , Closed [] ["[","|","]"]
+ , Infix [] [","] RightAssociative 1
  ]
 
 findOp op [] = []
@@ -364,99 +370,101 @@ tests = [
   ("1","1"),
   ("a","a"),
 
-  ("1 + 2","(+ 1 2)"),
-  ("a + 2","(+ a 2)"),
-  ("1 + b","(+ 1 b)"),
-  ("a + b","(+ a b)"),
-  ("1 * 2","(* 1 2)"),
+  ("1 + 2","⟨+ 1 2⟩"),
+  ("a + 2","⟨+ a 2⟩"),
+  ("1 + b","⟨+ 1 b⟩"),
+  ("a + b","⟨+ a b⟩"),
+  ("1 * 2","⟨* 1 2⟩"),
 
-  ("1 + 2 + 3","(+ (+ 1 2) 3)"),
-  ("1 + 2 * 3","(+ 1 (* 2 3))"),
-  ("1 * 2 + 3","(+ (* 1 2) 3)")
+  ("1 + 2 + 3","⟨+ ⟨+ 1 2⟩ 3⟩"),
+  ("1 + 2 * 3","⟨+ 1 ⟨* 2 3⟩⟩"),
+  ("1 * 2 + 3","⟨+ ⟨* 1 2⟩ 3⟩")
 
-  , ("0 << 1 + 2 * 3", "(<< 0 (+ 1 (* 2 3)))")
-  , ("0 + 1 << 2 * 3", "(<< (+ 0 1) (* 2 3))")
-  , ("0 + 1 * 2 << 3", "(<< (+ 0 (* 1 2)) 3)")
-  , ("0 << 1 * 2 + 3", "(<< 0 (+ (* 1 2) 3))")
-  , ("0 * 1 << 2 + 3", "(<< (* 0 1) (+ 2 3))")
-  , ("0 * 1 + 2 << 3", "(<< (+ (* 0 1) 2) 3)")
-  , ("(0 << 1) + 2 * 3", "(+ (<< 0 1) (* 2 3))")
-  , ("0 << (1 + 2) * 3", "(<< 0 (* (+ 1 2) 3))")
-  , ("0 << 1 + (2 * 3)", "(<< 0 (+ 1 (* 2 3)))")
-  , ("((0 << 1) + 2) * 3", "(* (+ (<< 0 1) 2) 3)")
-  , ("(((0 << 1) + 2) * 3)", "(* (+ (<< 0 1) 2) 3)")
-  , ("⟨<< 0 1⟩ + 2 * 3", "(+ (<< 0 1) (* 2 3))")
-  , ("⟨+ ⟨<< 0 1⟩ 2⟩ * 3", "(* (+ (<< 0 1) 2) 3)")
+  , ("0 << 1 + 2 * 3", "⟨<< 0 ⟨+ 1 ⟨* 2 3⟩⟩⟩")
+  , ("0 + 1 << 2 * 3", "⟨<< ⟨+ 0 1⟩ ⟨* 2 3⟩⟩")
+  , ("0 + 1 * 2 << 3", "⟨<< ⟨+ 0 ⟨* 1 2⟩⟩ 3⟩")
+  , ("0 << 1 * 2 + 3", "⟨<< 0 ⟨+ ⟨* 1 2⟩ 3⟩⟩")
+  , ("0 * 1 << 2 + 3", "⟨<< ⟨* 0 1⟩ ⟨+ 2 3⟩⟩")
+  , ("0 * 1 + 2 << 3", "⟨<< ⟨+ ⟨* 0 1⟩ 2⟩ 3⟩")
+  , ("(0 << 1) + 2 * 3", "⟨+ ⟨<< 0 1⟩ ⟨* 2 3⟩⟩")
+  , ("0 << (1 + 2) * 3", "⟨<< 0 ⟨* ⟨+ 1 2⟩ 3⟩⟩")
+  , ("0 << 1 + (2 * 3)", "⟨<< 0 ⟨+ 1 ⟨* 2 3⟩⟩⟩")
+  , ("((0 << 1) + 2) * 3", "⟨* ⟨+ ⟨<< 0 1⟩ 2⟩ 3⟩")
+  , ("(((0 << 1) + 2⟩ * 3⟩", "⟨* ⟨+ ⟨<< 0 1⟩ 2⟩ 3⟩")
+  , ("⟨<< 0 1⟩ + 2 * 3", "⟨+ ⟨<< 0 1⟩ ⟨* 2 3⟩⟩")
+  , ("⟨+ ⟨<< 0 1⟩ 2⟩ * 3", "⟨* ⟨+ ⟨<< 0 1⟩ 2⟩ 3⟩")
 
-  , ("f a","(f a)"),
-  ("f 1","(f 1)"),
-  ("f a b","(f a b)"),
-  ("f 1 b","(f 1 b)"),
-  ("f a 1","(f a 1)"),
+  , ("f a","⟨f a⟩"),
+  ("f 1","⟨f 1⟩"),
+  ("f a b","⟨f a b⟩"),
+  ("f 1 b","⟨f 1 b⟩"),
+  ("f a 1","⟨f a 1⟩"),
 
-  ("f a + 1","(+ (f a) 1)"),
-  ("1 + f a","(+ 1 (f a))"),
+  ("f a + 1","⟨+ ⟨f a⟩ 1⟩"),
+  ("1 + f a","⟨+ 1 ⟨f a⟩⟩"),
 
   ("(a)","a"),
   ("((a))","a"),
-  ("1 + (a)","(+ 1 a)"),
-  ("1 + ((a))","(+ 1 a)"),
-  ("(1 + 2)","(+ 1 2)"),
-  ("(1 + (a))","(+ 1 a)"),
-  ("(1 + ((a)))","(+ 1 a)"),
+  ("1 + (a)","⟨+ 1 a⟩"),
+  ("1 + ((a))","⟨+ 1 a⟩"),
+  ("(1 + 2)","⟨+ 1 2⟩"),
+  ("(1 + (a))","⟨+ 1 a⟩"),
+  ("(1 + ((a)))","⟨+ 1 a⟩"),
 
-  ("1 * (2 + 3)","(* 1 (+ 2 3))"),
-  ("(1 + 2) * 3","(* (+ 1 2) 3)"),
-  ("1 + (f a)","(+ 1 (f a))"),
-  ("(f a) + 1","(+ (f a) 1)"),
-  ("(f a b) 1","((f a b) 1)"),
-  ("(f a b) 1 2","((f a b) 1 2)"),
-  ("1 + (f a) 2","(+ 1 ((f a) 2))")
-  , ("f (a + b) (1 - 2)", "(f (+ a b) (- 1 2))")
+  ("1 * (2 + 3)","⟨* 1 ⟨+ 2 3⟩⟩"),
+  ("(1 + 2) * 3","⟨* ⟨+ 1 2⟩ 3⟩"),
+  ("1 + (f a)","⟨+ 1 ⟨f a⟩⟩"),
+  ("(f a) + 1","⟨+ ⟨f a⟩ 1⟩"),
+  ("(f a b) 1","⟨⟨f a b⟩ 1⟩"),
+  ("(f a b) 1 2","⟨⟨f a b⟩ 1 2⟩"),
+  ("1 + (f a) 2","⟨+ 1 ⟨⟨f a⟩ 2⟩⟩")
+  , ("f (a + b) (1 - 2)", "⟨f ⟨+ a b⟩ ⟨- 1 2⟩⟩")
 
-  , ("⟨1⟩", "(1)")
-  , ("⟨a⟩", "(a)")
-  , ("⟨⟨1⟩⟩", "((1))")
-  , ("⟨⟨a⟩⟩", "((a))")
-  , ("⟨+ a b⟩", "(+ a b)")
-  , ("⟨+ a b⟩ * (1 - 2)", "(* (+ a b) (- 1 2))")
-  , ("(a + b) * ⟨- 1 2⟩", "(* (+ a b) (- 1 2))")
-  , ("⟨* (a + b) (1 - 2)⟩", "(* (+ a b) (- 1 2))")
-  , ("⟨* (a + b) ⟨- 1 2⟩⟩", "(* (+ a b) (- 1 2))")
+  , ("⟨1⟩", "⟨1⟩")
+  , ("⟨a⟩", "⟨a⟩")
+  , ("⟨⟨1⟩⟩", "⟨⟨1⟩⟩")
+  , ("⟨⟨a⟩⟩", "⟨⟨a⟩⟩")
+  , ("⟨+ a b⟩", "⟨+ a b⟩")
+  , ("⟨+ a b⟩ * (1 - 2)", "⟨* ⟨+ a b⟩ ⟨- 1 2⟩⟩")
+  , ("(a + b) * ⟨- 1 2⟩", "⟨* ⟨+ a b⟩ ⟨- 1 2⟩⟩")
+  , ("⟨* (a + b) (1 - 2)⟩", "⟨* ⟨+ a b⟩ ⟨- 1 2⟩⟩")
+  , ("⟨* (a + b) ⟨- 1 2⟩⟩", "⟨* ⟨+ a b⟩ ⟨- 1 2⟩⟩")
 
-  , ("true ? 1 : 0", "(?: true 1 0)") -- TODO this sould be _?_:_ or __?__:__ or ␣?␣:␣
-  , ("true ? 1 : 0 + 1", "(?: true 1 (+ 0 1))")
-  , ("true ?' 1 :' 0 + 1", "(+ (?':' true 1 0) 1)")
+  , ("true ? 1 : 0", "⟨?: true 1 0⟩") -- TODO this sould be _?_:_ or __?__:__ or ␣?␣:␣
+  , ("true ? 1 : 0 + 1", "⟨?: true 1 ⟨+ 0 1⟩⟩")
+  , ("true ?' 1 :' 0 + 1", "⟨+ ⟨?':' true 1 0⟩ 1⟩")
 
-  , ("# a", "(# a)")
-  , ("a # b", "(a (# b))")
-  , ("# # a", "(# (# a))")
+  , ("# a", "⟨# a⟩")
+  , ("a # b", "⟨a ⟨# b⟩⟩")
+  , ("# # a", "⟨# ⟨# a⟩⟩")
 
-  , ("a !", "(! a)")
-  , ("a ! b", "((! a) b)")
-  , ("a ! !", "(! (! a))")
+  , ("a !", "⟨! a⟩")
+  , ("a ! b", "⟨⟨! a⟩ b⟩")
+  , ("a ! !", "⟨! ⟨! a⟩⟩")
 
-  , ("# a °", "(° (# a))")
+  , ("# a °", "⟨° ⟨# a⟩⟩")
 --  , ("# a %", Error "precedence cannot be mixed")
-  , ("# a !", "(# (! a))")
+  , ("# a !", "⟨# ⟨! a⟩⟩")
 
-  , ("if true then 1 else 0", "(ifthenelse true 1 0)")
-  , ("if 2 then 1 else 0", "(ifthenelse 2 1 0)")
-  , ("if a b then 1 else 0", "(ifthenelse (a b) 1 0)")
-  , ("if true then a b else 0", "(ifthenelse true (a b) 0)")
-  , ("if true then 1 else a b", "(ifthenelse true 1 (a b))")
-  , ("1 + if true then 1 else 0", "(+ 1 (ifthenelse true 1 0))")
-  , ("1 + if true then 1 else a b + c", "(+ 1 (ifthenelse true 1 (+ (a b) c)))")
+  , ("if true then 1 else 0", "⟨ifthenelse true 1 0⟩")
+  , ("if 2 then 1 else 0", "⟨ifthenelse 2 1 0⟩")
+  , ("if a b then 1 else 0", "⟨ifthenelse ⟨a b⟩ 1 0⟩")
+  , ("if true then a b else 0", "⟨ifthenelse true ⟨a b⟩ 0⟩")
+  , ("if true then 1 else a b", "⟨ifthenelse true 1 ⟨a b⟩⟩")
+  , ("1 + if true then 1 else 0", "⟨+ 1 ⟨ifthenelse true 1 0⟩⟩")
+  , ("1 + if true then 1 else a b + c", "⟨+ 1 ⟨ifthenelse true 1 ⟨+ ⟨a b⟩ c⟩⟩⟩")
 
-  , ("</ a />","(<//> a)")
-  , ("</ 0 />","(<//> 0)")
-  , ("</ f a b />","(<//> (f a b))")
-  , ("</ f 1 2 />","(<//> (f 1 2))")
-  , ("</ a + b />","(<//> (+ a b))")
-  , ("</ a + b * 2 />","(<//> (+ a (* b 2)))")
-  , ("</ a /> + 1","(+ (<//> a) 1)")
-  , ("1 + </ a />","(+ 1 (<//> a))")
-  , ("1 + </ a - b /> * 2","(+ 1 (* (<//> (- a b)) 2))")
+  , ("</ a />","⟨<//> a⟩")
+  , ("</ 0 />","⟨<//> 0⟩")
+  , ("</ f a b />","⟨<//> ⟨f a b⟩⟩")
+  , ("</ f 1 2 />","⟨<//> ⟨f 1 2⟩⟩")
+  , ("</ a + b />","⟨<//> ⟨+ a b⟩⟩")
+  , ("</ a + b * 2 />","⟨<//> ⟨+ a ⟨* b 2⟩⟩⟩")
+  , ("</ a /> + 1","⟨+ ⟨<//> a⟩ 1⟩")
+  , ("1 + </ a />","⟨+ 1 ⟨<//> a⟩⟩")
+  , ("1 + </ a - b /> * 2","⟨+ 1 ⟨* ⟨<//> ⟨- a b⟩⟩ 2⟩⟩")
+
+  , ("[ a | b ]","⟨[|] a b⟩")
 
   , ("2","2")
   ]
