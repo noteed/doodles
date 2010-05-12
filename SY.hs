@@ -35,7 +35,7 @@ data Op = Infix [String] [String] Associativity Precedence -- infix
         -- TODO SExpression so the user can choose the brackets for s-expr
   deriving Show
 
-data Kind = Discard | Keep | SExpression
+data Kind = Discard | Keep | SExpression | Distfix | DistfixAndDiscard
   deriving Show
 
 data Associativity = NonAssociative | LeftAssociative | RightAssociative
@@ -135,8 +135,14 @@ shunt' sh = case sh of
   S   (t@(Num _):ts)    ss                  (os:oss)                _ ->
     S ts                ss                  ((t:os):oss)            Inert
 
-  S   (t@(Sym _):ts)    (s@(L "⟨"):ss)      (os:oss)                _ ->
-    S ts                (s:ss)              ((t:os):oss)            SExpr
+  S   (t@(Sym x):ts)    (s@(L "⟨"):ss)      (os:oss)                _ ->
+    case findOp x someTable of
+      [Closed [_] _ DistfixAndDiscard] ->
+        S ts                (Op [x]:s:ss)       (os:oss)            StackApp
+      [Closed [_] _ Distfix] ->
+        S ts                (Op [x]:s:ss)       (os:oss)            StackApp
+      _ ->
+        S ts                (s:ss)              ((t:os):oss)        SExpr
 
   S   (t@(Node _):ts)   (s@(L "⟨"):ss)      (os:oss)                _ ->
     S ts                (s:ss)              ((t:os):oss)            SExpr
@@ -183,6 +189,14 @@ shunt' sh = case sh of
         | p1 < p2 ->
           S ts      (Op [x]:ss)           (apply s oss) StackOp
         | otherwise -> error $ "precedence cannot be mixed: " ++ show t ++ ", " ++ show s
+      ([o1@(Closed l1 [] Discard)], [o2@(Closed l2 [r2] Discard)])
+        | l2++[r2] == l1 ->
+         S (o:ts)           ss             (os:oss')             MatchedR
+         where ((o:os):oss') = oss
+      ([o1@(Closed l1 [] DistfixAndDiscard)], [o2@(Closed l2 [r2] DistfixAndDiscard)])
+        | l2++[r2] == l1 ->
+         S (o:ts)           ss             (os:oss')             MatchedR
+         where ((o:os):oss') = oss
       ([o1@(Closed l1 [] _)], [o2@(Closed l2 [r2] _)])
         | l2++[r2] == l1 ->
           S (o:ts)           ss       (os:oss')      MatchedR
@@ -225,9 +239,6 @@ shunt' sh = case sh of
   S   (t@(L "⟨"):ts)    ss                  (os:oss)                _ ->
     S ts                (t:ss)              ([]:os:oss)             StackApp
 
-  S   (t@(L _):ts)      ss                  (os:oss)                _ ->
-    S ts                (t:ss)              (os:oss)                StackL
-
   S   (t@(R "⟩"):ts)    (s@(L "⟨"):ss)      (os:h:oss)              _ ->
     S ts                ss                  ((ap:h):oss)            MatchedR
     where ap = Node (reverse os)
@@ -235,39 +246,23 @@ shunt' sh = case sh of
   S   (t:ts)            (s@(L "⟨"):ss)      (os:oss)                _ ->
     S ts                (s:ss)              ((t:os):oss)            SExpr
 
-  S   []                (s@(L _):ss)        oss                     _ ->
+  S   []                (s@(L "⟨"):ss)      oss                     _ ->
     S []                (s:ss)              oss                     UnmatchedL
 
-  S   (t@(R _):ts)      (s@(L _):ss)        ((o:os):oss)            _ ->
-    S (o':ts)           ss             (os:oss)             MatchedR
-    where -- keep parenthesis around : (1 + ((a))) will be (+ 1 ((a))), not (+ 1 a).
-          -- o' = case o of { Node [_] -> Node [o] ; Node _ -> o ; _ -> Node [o] }
-          -- o' = case o of { Node [_] -> Node [o] ; Node _ -> Node [o] ; _ -> Node [o] }
-          o' = o
+  S   (t@(R "⟩"):ts)    []                  (os:oss)         _ ->
+    S (t:ts)            []                  (os:oss)                 UnmatchedR
 
-  S   (t@(R _):ts)      []                  (os:oss)                _ ->
-    S (t:ts)            []                  (os:oss)                UnmatchedR
+  S   []                (s@(Op _):ss)       oss              _ ->
+    S []                ss                  (apply s oss)            FlushOp
 
-  S   (t@(R _):ts)      (s@(Op _):ss)       oss          _ ->
-    S (t:ts)            ss                  (apply s oss) FlushOp
-
-  S   (t@(R _):ts)      (s@(Sym _):ss)      oss              _ ->
-    S (t:ts)            ss                  (apply s oss)            FlushApp
-
-  S   (t@(R _):ts)      (s@(Node _):ss)     oss              _ ->
-    S (t:ts)            ss                  (apply s oss)            FlushApp
-
-  S   []                (s@(Op _):ss) oss          _ ->
-    S []                ss                  (apply s oss) FlushOp
-
-  S   []                (s@(Sym _):ss)      oss _ ->
+  S   []                (s@(Sym _):ss)      oss              _ ->
     S []                ss                  (apply s oss)            FlushApp
 
   S   []                (s@(Node _):ss)     oss             _ ->
     S []                ss                  (apply s oss)            FlushApp
 
-  S   []                []                  [[o]]                   _ ->
-    S []                []                  [[o]]                   Success
+  S   []                []                  [[o]]           _ ->
+    S []                []                  [[o]]                    Success
 
   _ -> sh { rule = Unexpected }
 
@@ -293,15 +288,14 @@ tokenize' ('⟩':cs) = " ⟩ " ++ tokenize' cs
 tokenize' (c:cs) = c : tokenize' cs
 tokenize' [] = []
 
-token (c:cs) | c `elem` ['a'..'z'] ++ "+-*/?:#i°%!<>[]|," = Sym (c:cs)
-             | c == '(' = L "("
+token (c:cs) | c `elem` ['a'..'z'] ++ "()+-*/?:#i°%!<>[]|," = Sym (c:cs)
              | c == '⟨' = L "⟨"
-             | c == ')' = R ")"
              | c == '⟩' = R "⟩"
              | otherwise = Num (read [c])
 
 someTable =
- [ Infix [] ["<<"] LeftAssociative 5
+ [ Closed [] ["(",")"] DistfixAndDiscard
+ , Infix [] ["<<"] LeftAssociative 5
  , Infix [] [">>"] LeftAssociative 5
  , Infix [] ["+"] LeftAssociative 6
  , Infix [] ["-"] LeftAssociative 6
@@ -398,7 +392,7 @@ tests = [
   , ("0 << (1 + 2) * 3", "⟨<< 0 ⟨* ⟨+ 1 2⟩ 3⟩⟩")
   , ("0 << 1 + (2 * 3)", "⟨<< 0 ⟨+ 1 ⟨* 2 3⟩⟩⟩")
   , ("((0 << 1) + 2) * 3", "⟨* ⟨+ ⟨<< 0 1⟩ 2⟩ 3⟩")
-  , ("(((0 << 1) + 2⟩ * 3⟩", "⟨* ⟨+ ⟨<< 0 1⟩ 2⟩ 3⟩")
+  , ("(((0 << 1) + 2) * 3)", "⟨* ⟨+ ⟨<< 0 1⟩ 2⟩ 3⟩")
   , ("⟨<< 0 1⟩ + 2 * 3", "⟨+ ⟨<< 0 1⟩ ⟨* 2 3⟩⟩")
   , ("⟨+ ⟨<< 0 1⟩ 2⟩ * 3", "⟨* ⟨+ ⟨<< 0 1⟩ 2⟩ 3⟩")
 
