@@ -31,9 +31,11 @@ data Tree = Node [Tree]
 data Op = Infix [String] [String] Associativity Precedence -- infix
         | Prefix [String] [String] Precedence -- prefix
         | Postfix [String] [String] Precedence -- postfix
-        | Closed [String] [String]
+        | Closed [String] [String] Kind
         -- TODO SExpression so the user can choose the brackets for s-expr
-        | SExpression [String] [String]
+  deriving Show
+
+data Kind = Discard | Keep | SExpression
   deriving Show
 
 data Associativity = NonAssociative | LeftAssociative | RightAssociative
@@ -124,7 +126,7 @@ shunt sh = case sh of
   S   ts                (s@(Op y):ss)      ([a]:oss) _ ->
     case findOps y someTable of
       [Postfix _ [] _] -> S (Node [s,a]:ts)    ss           ([]:oss)       FlushApp
-      [Closed _ []] -> S (Node [s,a]:ts)    ss           ([]:oss)       FlushApp
+      [Closed _ [] _] -> S (Node [s,a]:ts)    ss           ([]:oss)       FlushApp
       _ -> shunt' sh
   _ -> shunt' sh
 
@@ -143,7 +145,7 @@ shunt' sh = case sh of
     case findOp x someTable of
       [] -> S ts        (s:ss)              ((t:os):oss)          Application
       [Prefix [_] _ _] -> S ts    (t:s:ss)     ([]:os:oss)           StackOp
-      [Closed [_] _] -> S ts   (t:s:ss)     ([]:os:oss)           StackOp
+      [Closed [_] _ _] -> S ts   (t:s:ss)     ([]:os:oss)           StackOp
       _ ->  S (t:ts)    ss                  (apply s $ os:oss)    FlushApp
 
   S   (t@(Node _):ts)   (s@(Sym _):ss)      (os:oss)                _ ->
@@ -181,18 +183,18 @@ shunt' sh = case sh of
         | p1 < p2 ->
           S ts      (Op [x]:ss)           (apply s oss) StackOp
         | otherwise -> error $ "precedence cannot be mixed: " ++ show t ++ ", " ++ show s
-      ([o1@(Closed l1 [])], [o2@(Closed l2 [r2])])
+      ([o1@(Closed l1 [] _)], [o2@(Closed l2 [r2] _)])
         | l2++[r2] == l1 ->
           S (o:ts)           ss       (os:oss')      MatchedR
           where ((o:os):oss') = apply (Op l1) oss
-      ([o1@(Closed l1 r1)], [o2@(Closed l2 (r2:r2s))])
+      ([o1@(Closed l1 r1 _)], [o2@(Closed l2 (r2:r2s) _)])
         | l2++[r2] == l1 ->
           S ts      (Op l1:ss)            oss          StackOp
-      ([o1], [o2@(Closed _ _)]) ->
+      ([o1], [o2@(Closed _ _ _)]) ->
           S ts      (Op [x]:s:ss)         oss          StackOp
-      ([o1@(Closed _ [])], [_]) ->
+      ([o1@(Closed _ [] _)], [_]) ->
           S (t:ts)            ss                  (apply s oss) FlushOp
-      ([o1@(Closed _ _)], [_]) ->
+      ([o1@(Closed _ _ _)], [_]) ->
           S ts      (Op [x]:s:ss)           oss FlushOp
       _ -> error $ "TODO: " ++ show t ++ ", " ++ show s
 
@@ -310,8 +312,8 @@ someTable =
  , Postfix [] ["%"] 8
  , Postfix [] ["!"] 9
  , Prefix [] ["if","then","else"] 1
- , Closed [] ["</","/>"]
- , Closed [] ["[","|","]"]
+ , Closed [] ["</","/>"] Keep
+ , Closed [] ["[","|","]"] Keep
  , Infix [] [","] RightAssociative 1
  ]
 
@@ -331,10 +333,10 @@ findOp op (Postfix [] parts p:xs)
      let (l,r) = break' (== op) parts
      in Postfix l r p : findOp op xs
   | otherwise = findOp op xs
-findOp op (Closed [] parts:xs)
+findOp op (Closed [] parts k:xs)
   | op `elem` parts =
      let (l,r) = break' (== op) parts
-     in Closed l r : findOp op xs
+     in Closed l r k : findOp op xs
   | otherwise = findOp op xs
 
 findOps ops [] = []
@@ -347,8 +349,8 @@ findOps ops (Prefix [] parts p:xs)
 findOps ops (Postfix [] parts p:xs)
   | ops `isPrefixOf` parts = Postfix ops (drop (length ops) parts) p : findOps ops xs
   | otherwise = findOps ops xs
-findOps ops (Closed [] parts:xs)
-  | ops `isPrefixOf` parts = Closed ops (drop (length ops) parts) : findOps ops xs
+findOps ops (Closed [] parts k:xs)
+  | ops `isPrefixOf` parts = Closed ops (drop (length ops) parts) k : findOps ops xs
   | otherwise = findOps ops xs
 
 break' p ls = case break p ls of
@@ -358,7 +360,7 @@ break' p ls = case break p ls of
 apply s@(Op y) (os:oss) = (Node (s:reverse l) : r) : oss
   where nargs = case findOps y someTable of
           [Infix _ _ _ _] -> length y + 1
-          [Closed _ _] -> length y - 1
+          [Closed _ _ _] -> length y - 1
           [_] -> length y
           [] -> error $ "bug: wrong use of apply: " ++ show y
         (l,r) = splitAt nargs os -- TODO test correct lenght of os
@@ -467,6 +469,9 @@ tests = [
   , ("</ a /> + 1","⟨+ ⟨<//> a⟩ 1⟩")
   , ("1 + </ a />","⟨+ 1 ⟨<//> a⟩⟩")
   , ("1 + </ a - b /> * 2","⟨+ 1 ⟨* ⟨<//> ⟨- a b⟩⟩ 2⟩⟩")
+  , ("</ a + b /> c","⟨⟨<//> ⟨+ a b⟩⟩ c⟩")
+  , ("f </ a />","⟨f ⟨<//> a⟩⟩")
+  , ("f </ a + b />","⟨f ⟨<//> ⟨+ a b⟩⟩⟩")
 
   , ("[ a | b ]","⟨[|] a b⟩")
 
