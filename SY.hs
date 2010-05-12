@@ -8,6 +8,7 @@
 -- rule should be associated to a same behavior.
 -- TODO the precedence comparison should depends on the
 -- associativity even for Pre/Postfix (see 'lower').
+-- (TODO a pre/postfix operator can be associative or non-associative.)
 -- TODO factorize
 -- TODO is ! a + b allowed if ! and + have the same precedence?
 -- TODO allow specific operator table for internal operator holes
@@ -138,9 +139,6 @@ shunt' sh = case sh of
       [Closed [_] _ _] -> S ts   (Op [x]:s:ss) (os:oss)           StackOp
       _ ->  S (t:ts)    ss                  (apply s $ os:oss)    FlushApp
 
-  S   (t@(Node _):ts)   (s@(Sym _):ss)      (os:oss)                _ ->
-    S ts                (s:ss)              ((t:os):oss)            Application
-
   S   (t@(Sym x):ts) (s@(Op y):ss) oss      _ ->
     case (findOp x someTable, findOps y someTable) of
       ([],[o2@(Closed [_] _ SExpression)]) ->
@@ -153,9 +151,6 @@ shunt' sh = case sh of
       ([Closed [_] _ Distfix],[o2@(Closed [_] _ SExpression)]) ->
         S ts                (Op [x]:s:ss)       (os:oss')           StackApp
         where (os:oss') = oss
---      (_,[o2@(Closed [_] _ SExpression)]) ->
---        S ts                (s:ss)              ((t:os):oss')       SExpr
---        where (os:oss') = oss
       ([o1@(Infix [_] [] _ _)], [o2@(Infix [_] [] _ _)]) ->
         flushLower o1 x ts (s:ss) oss
       ([o1@(Infix l1 r1 _ _)], [o2@(Infix l2 (r2:r2s) _ _)])
@@ -221,20 +216,10 @@ shunt' sh = case sh of
           S ts      (Op [x]:s:ss)           oss FlushOp
       _ -> error $ "TODO: " ++ show t ++ ", " ++ show s
 
-  S   (t@(Node _):ts) (s@(Op y):ss)       (os:oss)               _ ->
-    case findOps y someTable of
-      [o2@(Closed [_] _ SExpression)] ->
-        S ts              (s:ss)              ((t:os):oss)         SExpr
-      _ ->
-        S ts              (t:s:ss)            ([]:os:oss)          StackApp
-
   S   (t@(Sym x):ts) (s@(Node _):ss)   (os:oss)              _ ->
     case findOp x someTable of
       [] -> S ts        (s:ss)              ((t:os):oss)          Application
       _ -> S (t:ts)     ss                  (apply s $ os:oss)            FlushApp
-
-  S   (t@(Node _):ts) (s@(Node _):ss)       (os:oss)              _ ->
-    S ts              (s:ss)                ((t:os):oss)          Application
 
   S   (t@(Sym x):ts)    ss                  (os:oss)                _ ->
     case findOp x someTable of
@@ -247,8 +232,21 @@ shunt' sh = case sh of
         [Closed [_] _ SExpression] -> S ts   (Op [x]:ss) ([]:os:oss)           StackOp
         _ -> S ts      (Op [x]:ss)  (os:oss)  StackOp
 
-  S   (t@(Node _):ts)    ss                  (os:oss)                _ ->
-    S ts                 (t:ss)              ([]:os:oss)             StackApp
+  S   (t@(Node _):ts) (s@(Op y):ss)       (os:oss)               _ ->
+    case findOps y someTable of
+      [o2@(Closed [_] _ SExpression)] ->
+        S ts              (s:ss)              ((t:os):oss)         SExpr
+      _ ->
+        S ts              (t:s:ss)            ([]:os:oss)          StackApp
+
+  S   (t@(Node _):ts) (s@(Sym _):ss)        (os:oss)                _ ->
+    S ts              (s:ss)                ((t:os):oss)            Application
+
+  S   (t@(Node _):ts) (s@(Node _):ss)       (os:oss)                _ ->
+    S ts              (s:ss)                ((t:os):oss)            Application
+
+  S   (t@(Node _):ts)   ss                  (os:oss)                _ ->
+    S ts                (t:ss)              ([]:os:oss)             StackApp
 
   S   []                (s@(Op _):ss)       oss              _ ->
     S []                ss                  (apply s oss)            FlushOp
