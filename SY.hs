@@ -11,6 +11,8 @@
 -- TODO factorize
 -- TODO regroup Closed and L and R?
 -- TODO is ! a + b allowed if ! and + have the same precedence?
+-- TODO allow specific operator table for internal operator holes
+-- (e.g. to reuse a same symbol with different fixity/precedecence).
 
 module SY where
 
@@ -30,6 +32,8 @@ data Op = Infix [String] [String] Associativity Precedence -- infix
         | Prefix [String] [String] Precedence -- prefix
         | Postfix [String] [String] Precedence -- postfix
         | Closed [String] [String]
+        -- TODO SExpression so the user can choose the brackets for s-expr
+        | SExpression [String] [String]
   deriving Show
 
 data Associativity = NonAssociative | LeftAssociative | RightAssociative
