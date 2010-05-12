@@ -144,8 +144,8 @@ shunt' sh = case sh of
   S   (t@(Sym x):ts)    (s@(Sym _):ss)      (os:oss) _ ->
     case findOp x someTable of
       [] -> S ts        (s:ss)              ((t:os):oss)          Application
-      [Prefix [_] _ _] -> S ts    (t:s:ss)     ([]:os:oss)           StackOp
-      [Closed [_] _ _] -> S ts   (t:s:ss)     ([]:os:oss)           StackOp
+      [Prefix [_] _ _] -> S ts   (Op [x]:s:ss) (os:oss)           StackOp
+      [Closed [_] _ _] -> S ts   (Op [x]:s:ss) (os:oss)           StackOp
       _ ->  S (t:ts)    ss                  (apply s $ os:oss)    FlushApp
 
   S   (t@(Node _):ts)   (s@(Sym _):ss)      (os:oss)                _ ->
@@ -214,7 +214,9 @@ shunt' sh = case sh of
       [] -> S ts       (t:ss)              ([]:os:oss)             StackApp
       -- x is the first sub-op, and the stack is empty or has a left bracket at its top.
       _ -> case findOps [x] someTable of
-        [] -> error "using middle sub-op as first sub-op"
+        [] -> error $ "using middle sub-op " ++ x ++ " as first sub-op." ++
+                      "\nstack: " ++ show ss ++
+                      "\noutput: " ++ show (os:oss)
         _ -> S ts      (Op [x]:ss)  (os:oss)  StackOp
 
   S   (t@(Node _):ts)    ss                  (os:oss)                _ ->
@@ -459,6 +461,7 @@ tests = [
   , ("if true then 1 else a b", "⟨ifthenelse true 1 ⟨a b⟩⟩")
   , ("1 + if true then 1 else 0", "⟨+ 1 ⟨ifthenelse true 1 0⟩⟩")
   , ("1 + if true then 1 else a b + c", "⟨+ 1 ⟨ifthenelse true 1 ⟨+ ⟨a b⟩ c⟩⟩⟩")
+  , ("f if true then 1 else 0", "⟨f ⟨ifthenelse true 1 0⟩⟩")
 
   , ("</ a />","⟨<//> a⟩")
   , ("</ 0 />","⟨<//> 0⟩")
