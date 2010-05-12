@@ -9,7 +9,6 @@
 -- TODO the precedence comparison should depends on the
 -- associativity even for Pre/Postfix (see 'lower').
 -- TODO factorize
--- TODO regroup Closed and L and R?
 -- TODO is ! a + b allowed if ! and + have the same precedence?
 -- TODO allow specific operator table for internal operator holes
 -- (e.g. to reuse a same symbol with different fixity/precedecence).
@@ -25,8 +24,6 @@ data Tree = Node [Tree]
            | Num Int
            | Sym String
            | Op [String] -- on the stack, TODO turn into Sym on the output
-           | L String -- left paren
-           | R String -- right paren
 
 data Op = Infix [String] [String] Associativity Precedence -- infix
         | Prefix [String] [String] Precedence -- prefix
@@ -51,9 +48,7 @@ display = tail . display'
   where
   display' (Num i) = ' ' : show i
   display' (Sym s) = ' ' : s
-  display' (L s) = ' ' : s
   display' (Op l) = ' ' : concat l
-  display' (R s) = ' ' : s
   display' (Node es) = ' ' : '⟨' : tail (concatMap display' es) ++ "⟩"
 
 associativity (Infix _ _ a _) = a
@@ -135,22 +130,11 @@ shunt' sh = case sh of
   S   (t@(Num _):ts)    ss                  (os:oss)                _ ->
     S ts                ss                  ((t:os):oss)            Inert
 
-  S   (t@(Sym x):ts)    (s@(L "⟨"):ss)      (os:oss)                _ ->
-    case findOp x someTable of
-      [Closed [_] _ DistfixAndDiscard] ->
-        S ts                (Op [x]:s:ss)       (os:oss)            StackApp
-      [Closed [_] _ Distfix] ->
-        S ts                (Op [x]:s:ss)       (os:oss)            StackApp
-      _ ->
-        S ts                (s:ss)              ((t:os):oss)        SExpr
-
-  S   (t@(Node _):ts)   (s@(L "⟨"):ss)      (os:oss)                _ ->
-    S ts                (s:ss)              ((t:os):oss)            SExpr
-
   S   (t@(Sym x):ts)    (s@(Sym _):ss)      (os:oss) _ ->
     case findOp x someTable of
       [] -> S ts        (s:ss)              ((t:os):oss)          Application
       [Prefix [_] _ _] -> S ts   (Op [x]:s:ss) (os:oss)           StackOp
+      [Closed [_] _ SExpression] -> S ts   (Op [x]:s:ss) ([]:os:oss)           StackOp
       [Closed [_] _ _] -> S ts   (Op [x]:s:ss) (os:oss)           StackOp
       _ ->  S (t:ts)    ss                  (apply s $ os:oss)    FlushApp
 
@@ -159,7 +143,19 @@ shunt' sh = case sh of
 
   S   (t@(Sym x):ts) (s@(Op y):ss) oss      _ ->
     case (findOp x someTable, findOps y someTable) of
+      ([],[o2@(Closed [_] _ SExpression)]) ->
+        S ts                (s:ss)              ((t:os):oss')       SExpr
+        where (os:oss') = oss
       ([], _) -> S ts   (t:s:ss)            ([]:oss)             StackApp
+      ([Closed [_] _ DistfixAndDiscard],[o2@(Closed [_] _ SExpression)]) ->
+        S ts                (Op [x]:s:ss)       (os:oss')           StackApp
+        where (os:oss') = oss
+      ([Closed [_] _ Distfix],[o2@(Closed [_] _ SExpression)]) ->
+        S ts                (Op [x]:s:ss)       (os:oss')           StackApp
+        where (os:oss') = oss
+--      (_,[o2@(Closed [_] _ SExpression)]) ->
+--        S ts                (s:ss)              ((t:os):oss')       SExpr
+--        where (os:oss') = oss
       ([o1@(Infix [_] [] _ _)], [o2@(Infix [_] [] _ _)]) ->
         flushLower o1 x ts (s:ss) oss
       ([o1@(Infix l1 r1 _ _)], [o2@(Infix l2 (r2:r2s) _ _)])
@@ -189,6 +185,10 @@ shunt' sh = case sh of
         | p1 < p2 ->
           S ts      (Op [x]:ss)           (apply s oss) StackOp
         | otherwise -> error $ "precedence cannot be mixed: " ++ show t ++ ", " ++ show s
+      ([o1@(Closed [_] _ SExpression)], _) ->
+        S ts                (Op [x]:s:ss)              ([]:os:oss')            StackApp
+        where (os:oss') = oss
+
       ([o1@(Closed l1 [] Discard)], [o2@(Closed l2 [r2] Discard)])
         | l2++[r2] == l1 ->
          S (o:ts)           ss             (os:oss')             MatchedR
@@ -197,6 +197,12 @@ shunt' sh = case sh of
         | l2++[r2] == l1 ->
          S (o:ts)           ss             (os:oss')             MatchedR
          where ((o:os):oss') = oss
+      ([o1@(Closed l1 [] SExpression)], [o2@(Closed l2 [r2] SExpression)])
+        | l2++[r2] == l1 ->
+          S ts                ss                  ((ap:h):oss')           MatchedR
+          where (os:h:oss') = oss
+                ap = Node (reverse os)
+
       ([o1@(Closed l1 [] _)], [o2@(Closed l2 [r2] _)])
         | l2++[r2] == l1 ->
           S (o:ts)           ss       (os:oss')      MatchedR
@@ -204,6 +210,9 @@ shunt' sh = case sh of
       ([o1@(Closed l1 r1 _)], [o2@(Closed l2 (r2:r2s) _)])
         | l2++[r2] == l1 ->
           S ts      (Op l1:ss)            oss          StackOp
+      (_,[o2@(Closed [_] _ SExpression)]) ->
+        S ts                (s:ss)              ((t:os):oss')           SExpr
+        where (os:oss') = oss
       ([o1], [o2@(Closed _ _ _)]) ->
           S ts      (Op [x]:s:ss)         oss          StackOp
       ([o1@(Closed _ [] _)], [_]) ->
@@ -212,8 +221,12 @@ shunt' sh = case sh of
           S ts      (Op [x]:s:ss)           oss FlushOp
       _ -> error $ "TODO: " ++ show t ++ ", " ++ show s
 
-  S   (t@(Node _):ts) (s@(Op _):ss)       oss                  _ ->
-    S ts              (t:s:ss)            ([]:oss)             StackApp
+  S   (t@(Node _):ts) (s@(Op y):ss)       (os:oss)               _ ->
+    case findOps y someTable of
+      [o2@(Closed [_] _ SExpression)] ->
+        S ts              (s:ss)              ((t:os):oss)         SExpr
+      _ ->
+        S ts              (t:s:ss)            ([]:os:oss)          StackApp
 
   S   (t@(Sym x):ts) (s@(Node _):ss)   (os:oss)              _ ->
     case findOp x someTable of
@@ -231,26 +244,11 @@ shunt' sh = case sh of
         [] -> error $ "using middle sub-op " ++ x ++ " as first sub-op." ++
                       "\nstack: " ++ show ss ++
                       "\noutput: " ++ show (os:oss)
+        [Closed [_] _ SExpression] -> S ts   (Op [x]:ss) ([]:os:oss)           StackOp
         _ -> S ts      (Op [x]:ss)  (os:oss)  StackOp
 
   S   (t@(Node _):ts)    ss                  (os:oss)                _ ->
     S ts                 (t:ss)              ([]:os:oss)             StackApp
-
-  S   (t@(L "⟨"):ts)    ss                  (os:oss)                _ ->
-    S ts                (t:ss)              ([]:os:oss)             StackApp
-
-  S   (t@(R "⟩"):ts)    (s@(L "⟨"):ss)      (os:h:oss)              _ ->
-    S ts                ss                  ((ap:h):oss)            MatchedR
-    where ap = Node (reverse os)
-
-  S   (t:ts)            (s@(L "⟨"):ss)      (os:oss)                _ ->
-    S ts                (s:ss)              ((t:os):oss)            SExpr
-
-  S   []                (s@(L "⟨"):ss)      oss                     _ ->
-    S []                (s:ss)              oss                     UnmatchedL
-
-  S   (t@(R "⟩"):ts)    []                  (os:oss)         _ ->
-    S (t:ts)            []                  (os:oss)                 UnmatchedR
 
   S   []                (s@(Op _):ss)       oss              _ ->
     S []                ss                  (apply s oss)            FlushOp
@@ -288,13 +286,12 @@ tokenize' ('⟩':cs) = " ⟩ " ++ tokenize' cs
 tokenize' (c:cs) = c : tokenize' cs
 tokenize' [] = []
 
-token (c:cs) | c `elem` ['a'..'z'] ++ "()+-*/?:#i°%!<>[]|," = Sym (c:cs)
-             | c == '⟨' = L "⟨"
-             | c == '⟩' = R "⟩"
+token (c:cs) | c `elem` ['a'..'z'] ++ "()⟨⟩+-*/?:#i°%!<>[]|," = Sym (c:cs)
              | otherwise = Num (read [c])
 
 someTable =
  [ Closed [] ["(",")"] DistfixAndDiscard
+ , Closed [] ["⟨","⟩"] SExpression
  , Infix [] ["<<"] LeftAssociative 5
  , Infix [] [">>"] LeftAssociative 5
  , Infix [] ["+"] LeftAssociative 6
